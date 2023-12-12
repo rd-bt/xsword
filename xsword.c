@@ -30,6 +30,8 @@
 #define TOCSTR(x) TOCSTR0(x)
 #define TOCSTR0(x) #x
 char buf_stdout[BUFSIZE_STDOUT];
+char keywords[BUFSIZE];
+size_t keylen=0;
 char cperms[8]={"****"};
 size_t align=1;
 int quiet=0;
@@ -239,6 +241,7 @@ int permscmp(const char *restrict s1,const char *restrict s2){
 	}
 	return 0;
 }
+
 ssize_t readall(int fd,void **pbuf){
 	char *buf,*p;
 	size_t bufsiz;
@@ -470,20 +473,35 @@ int getfuzzymode(const char *p1,int *restrict cmpmode){
 	if(ok)*cmpmode=cm;
 	return ok;
 }
+int findkeyword(const char *vn){
+	char keys[BUFSIZE],*p;
+	if(!keylen)return 1;
+	if(!vn[0])return 0;
+	memcpy(keys,keywords,keylen+1);
+	p=strtok(keys," ");
+	if(p)do{
+		if(strstr(vn,p))return 1;
+	}while((p=strtok(NULL," ")));
+	return 0;
+}
 size_t sizeofmap(const char *pr){
+	int r;
 	const char *p;
-	char perms[sizeof("rwxp")];
+	char perms[sizeof("rwxp")],vmname[(BUFSIZE+1+15)&~15],buf[(BUFSIZE+1+15)&~15];
 	void *sa,*ea;
 	size_t ret=0;
 	while(*pr){
 	p=strchr(pr,'\n');
 	if(!p)return ret;
-	if(sscanf(pr,"%lx-%lx %s",(unsigned long *)&sa,(unsigned long *)&ea,perms)<3){
+	memcpy(buf,pr,p-pr);
+	buf[p-pr]=0;
+	if((r=sscanf(buf,"%lx-%lx %s %*s %*s %*s %" TOCSTR(BUFSIZE) "[^\n]",(unsigned long *)&sa,(unsigned long *)&ea,perms,vmname))<3){
 		pr=p+1;
 		continue;
 	}
+	if(r<4)vmname[0]=0;
 	pr=p+1;
-	if(permscmp(perms,cperms))continue;
+	if(permscmp(perms,cperms)||!findkeyword(vmname))continue;
 	ret+=(size_t)ea-(size_t)sa;
 	continue;
 	}
@@ -584,7 +602,7 @@ int search(int fdmap,int fdmem,void *val,size_t len,struct addrset *as){
 	}
 	if(sscanf(pr,"%lx-%lx %s %*s %*s %*s %" TOCSTR(BUFSIZE) "[^\n]",(unsigned long *)&sa,(unsigned long *)&ea,perms,vmname)<4)vmname[0]=0;
 	pr+=strlen(pr)+1;
-	if(permscmp(perms,cperms))goto notfound1;
+	if(permscmp(perms,cperms)||!findkeyword(vmname))goto notfound1;
 	size=(size_t)ea-(size_t)sa;
 	scanned+=size;
 	pct=scanned*100/sr;
@@ -648,7 +666,7 @@ int search_cmp(int fdmap,int fdmem,const void *val,size_t len,struct addrset *as
 	}
 	if(sscanf(pr,"%lx-%lx %s %*s %*s %*s %" TOCSTR(BUFSIZE) "[^\n]",(unsigned long *)&sa,(unsigned long *)&ea,perms,vmname)<4)vmname[0]=0;
 	pr+=strlen(pr)+1;
-	if(permscmp(perms,cperms))goto notfound1;
+	if(permscmp(perms,cperms)||!findkeyword(vmname))goto notfound1;
 	size=(size_t)ea-(size_t)sa;
 	scanned+=size;
 	pct=scanned*100/sr;
@@ -713,7 +731,7 @@ int search_fuzzy(int fdmap,int fdmem,size_t len,struct addrset *as){
 	}
 	if(sscanf(pr,"%lx-%lx %s %*s %*s %*s %" TOCSTR(BUFSIZE) "[^\n]",(unsigned long *)&sa,(unsigned long *)&ea,perms,vmname)<4)vmname[0]=0;
 	pr+=strlen(pr)+1;
-	if(permscmp(perms,cperms))goto notfound1;
+	if(permscmp(perms,cperms)||!findkeyword(vmname))goto notfound1;
 	size=(size_t)ea-(size_t)sa;
 	scanned+=size;
 	pct=scanned*100/sr;
@@ -839,6 +857,7 @@ void help(char *arg){
 	"ftimer,t x -- use x(decimal,second) as the interval in \"freeze\",default 0.125\n"
 	"freeze,f x -- write x to hit addresses looply\n"
 	"help,h,usage -- print this help\n"
+	"key [x] -- show or set keyword to x used for first scanning,matched with vmname,separated by space\n"
 	"list,l,ls -- list values hit\n"
 	"nest,n [x|inf] -- redo the lasted command 1 or x times,or endless until SIGINT gained\n"
 	"perms,p [x] -- show or set the perms filter used at first scanning to x\n"
@@ -1045,6 +1064,17 @@ back_to_next:
 		}else if(ibuf[3]!=' ')goto invcmd;
 		fprintf(stdout,"%s\n",ibuf+4);
 		fflush(stdout);
+		goto nextloop;
+	}else if(!strcmp(cmd,"key")){
+		if(ibuf[3]==0){
+			if(keylen){
+				keywords[keylen]='\n';
+				write(STDERR_FILENO,keywords,keylen+1);
+				keywords[keylen]=0;
+			}
+			goto nextloop;
+		}//else if(ibuf[3]!=' ')goto invcmd;
+		memcpy(keywords,ibuf+4,(keylen=strlen(ibuf+4))+1);
 		goto nextloop;
 	}else if(!strcmp(cmd,"select")||!strcmp(cmd,"s")){
 		aset_wipe(&as);
