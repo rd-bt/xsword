@@ -1121,7 +1121,7 @@ back_to_freeze:
 reset:
 		aset_wipe(&as);
 		goto nextloop;
-	}else if(!strcmp(cmd,"perms")&&!strcmp(cmd,"p")){
+	}else if(!strcmp(cmd,"perms")||!strcmp(cmd,"p")){
 		strtok(ibuf," \t");
 		p=strtok(NULL," \t");
 		if(p&&strlen(p)==4){
