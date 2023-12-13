@@ -260,6 +260,25 @@ endf:
 			fbuf[r]='0';
 			while(fbuf[--r]=='0');
 			fwrite(fbuf,1,r+2,stdout);
+			if(aset->valued&&memcmp(aset->buf[i].val,buf,len))
+				switch(vtype){
+					case VT_FLOAT:
+					r=sprintf(fbuf," %.128f",*(float *)aset->buf[i].val);
+					goto endf1;
+					case VT_DOUBLE:
+					r=sprintf(fbuf," %.128lf",*(double *)aset->buf[i].val);
+					goto endf1;
+					case VT_LDOUBLE:
+					r=sprintf(fbuf," %.128Lf",*(long double *)aset->buf[i].val);
+					goto endf1;
+endf1:
+				fbuf[r]='0';
+				while(fbuf[--r]=='0');
+				fwrite(" from :",1,8,stdout);
+				fwrite(fbuf,1,r+2,stdout);
+				default:
+					break;
+			}
 			break;
 			default:
 errf:
@@ -665,14 +684,17 @@ size_t sizeofmap(const char *pr){
 	}
 	return ret;
 }
-int research(const struct addrset *restrict oldas,int fdmem,const void *restrict val,size_t len,struct addrset *restrict as){
+int researchu(const struct addrset *restrict oldas,int fdmem,const void *val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
 	size_t i=0,n=0,pct,pct_old=0;
-	char *buf;
+	char *buf=NULL;
 	int r0;
 	buf=malloc((len+15)&~15);
 	if(!buf)return errno;
 	while(i<oldas->n&&freezing){
-		if(pread(fdmem,buf,len,oldas->buf[i].addr)>0)
+		if(pread(fdmem,buf,len,oldas->buf[i].addr)==len){
+			if(!val)goto fuzzy;
+			if(compar)goto compare;
+		}else goto end;
 		if(!memcmp(buf,val,len)){
 			r0=aset_addv(as,oldas->buf[i].addr,val,len);
 			if(r0<0){
@@ -681,6 +703,27 @@ int research(const struct addrset *restrict oldas,int fdmem,const void *restrict
 			}
 			++n;
 		}
+		goto end;
+compare:
+		if(compar(buf,val)){
+			if((r0=aset_addv(as,oldas->buf[i].addr,buf,len))<0){
+				free(buf);
+				return -r0;
+			}
+			++n;
+		}
+		goto end;
+fuzzy:
+		if(compar(buf,oldas->buf[i].val)){
+			if((r0=aset_addv(as,oldas->buf[i].addr,buf,len))<0){
+				free(buf);
+				return -r0;
+			}
+			++n;
+		}
+
+		goto end;
+end:
 		++i;
 		pct=i*100/oldas->n;
 		if(pct>pct_old){
@@ -690,50 +733,6 @@ int research(const struct addrset *restrict oldas,int fdmem,const void *restrict
 	}
 	fdprintf_atomic(STDERR_FILENO,"\n");
 	free(buf);
-	return 0;
-}
-int research_cmp(const struct addrset *restrict oldas,int fdmem,const void *val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
-	size_t i=0,n=0,pct,pct_old=0;
-	char vbuf[VBUFSIZE];
-	int r0;
-	while(i<oldas->n&&freezing){
-		if(pread(fdmem,vbuf,len,oldas->buf[i].addr)==len)
-		if(compar(vbuf,val)){
-			if((r0=aset_addv(as,oldas->buf[i].addr,vbuf,len))<0){
-				return -r0;
-			}
-			++n;
-		}
-		++i;
-		pct=i*100/oldas->n;
-		if(pct>pct_old){
-		fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",pct,n);
-		pct_old=pct;
-		}
-	}
-	fdprintf_atomic(STDERR_FILENO,"\n");
-	return 0;
-}
-int research_fuzzy(const struct addrset *restrict oldas,int fdmem,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
-	size_t i=0,n=0,pct,pct_old=0;
-	char vbuf[VBUFSIZE];
-	int r0;
-	while(i<oldas->n&&freezing){
-		if(pread(fdmem,vbuf,len,oldas->buf[i].addr)==len)
-		if(compar(vbuf,oldas->buf[i].val)){
-			if((r0=aset_addv(as,oldas->buf[i].addr,vbuf,len))<0){
-				return -r0;
-			}
-			++n;
-		}
-		++i;
-		pct=i*100/oldas->n;
-		if(pct>pct_old){
-		fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",pct,n);
-		pct_old=pct;
-		}
-	}
-	fdprintf_atomic(STDERR_FILENO,"\n");
 	return 0;
 }
 int searchu(int fdmap,int fdmem,void *val,size_t len,struct addrset *as,int (*compar)(const void *,const void *)){
@@ -774,6 +773,7 @@ int searchu(int fdmap,int fdmem,void *val,size_t len,struct addrset *as,int (*co
 	}
 	buf2=p;
 	if((r0=pread(fdmem,buf2,size,(off_t)sa))==0)goto notfound;
+	if(!quiet)write(STDERR_FILENO,"-> ",3);
 	if(r0<0){
 		if(!quiet)fdprintf_atomic(STDERR_FILENO,"failed (%s) %s%s%s\n",strerror(errno),vmname[0]?"(":"",vmname,vmname[0]?")":"");
 		goto notfound1;
@@ -818,7 +818,7 @@ fuzzy:
 	goto end;
 end:
 notfound:
-	if(!quiet)fdprintf_atomic(STDERR_FILENO,"-> %zu / %zu\t%s%s%s\n",n,as->n,vmname[0]?"(":"",vmname,vmname[0]?")":"");
+	if(!quiet)fdprintf_atomic(STDERR_FILENO,"%zu / %zu\t%s%s%s\n",n,as->n,vmname[0]?"(":"",vmname,vmname[0]?")":"");
 	else fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",pct,as->n);
 
 notfound1:
@@ -829,199 +829,6 @@ notfound1:
 	if(quiet)fdprintf_atomic(STDERR_FILENO,"\n");
 	return 0;
 }
-/*
-int search(int fdmap,int fdmem,void *val,size_t len,struct addrset *as){
-	char *buf2,*rbuf,perms[sizeof("rwxp")],vmname[(BUFSIZE+1+15)&~15];
-	void *sa,*ea;
-	char *p,*pr;
-	size_t n,size,scanned=0,pct;
-	ssize_t sr;
-	int r0;
-	if(len==0)return 0;
-	buf2=NULL;
-	sr=readall(fdmap,(void **)&rbuf);
-	if(sr<0){
-		return (int)-sr;
-	}
-	sr=sizeofmap(rbuf);
-	pr=rbuf;
-	if(quiet)fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",0lu,as->n);
-	while(*pr&&freezing){
-	n=0;
-	p=strchr(pr,'\n');
-	if(p){
-		*p=0;
-	}
-	if(sscanf(pr,"%lx-%lx %s %*s %*s %*s %" TOCSTR(BUFSIZE) "[^\n]",(unsigned long *)&sa,(unsigned long *)&ea,perms,vmname)<4)vmname[0]=0;
-	pr+=strlen(pr)+1;
-	if(permscmp(perms,cperms)||!findkeyword(vmname))goto notfound1;
-	size=(size_t)ea-(size_t)sa;
-	scanned+=size;
-	pct=scanned*100/sr;
-	if(!quiet)fdprintf_atomic(STDERR_FILENO,"[%3zu%%] %lx-%lx %s ",pct,(uintptr_t)sa,(uintptr_t)ea,perms);
-	p=realloc(buf2,size);
-	if(!p){
-		r0=errno;
-		if(buf2)free(buf2);
-		free(rbuf);
-		return r0;
-	}
-	buf2=p;
-	if((r0=pread(fdmem,buf2,size,(off_t)sa))==0)goto notfound;
-	if(r0<0){
-		if(!quiet)fdprintf_atomic(STDERR_FILENO,"failed (%s) %s%s%s\n",strerror(errno),vmname[0]?"(":"",vmname,vmname[0]?")":"");
-		goto notfound1;
-	}
-	while((p=memmem_aligned(p,size-(size_t)(p-buf2),val,len,align))){
-		++n;
-		if((r0=aset_addv(as,(off_t)((uintptr_t)sa+(p-buf2)),val,len))<0){
-			if(buf2)free(buf2);
-			free(rbuf);
-			return -r0;
-		}
-		if((size_t)(p-buf2)<size)
-		p+=align;
-	}
-notfound:
-	if(!quiet)fdprintf_atomic(STDERR_FILENO,"-> %zu / %zu\t%s%s%s\n",n,as->n,vmname[0]?"(":"",vmname,vmname[0]?")":"");
-	else fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",pct,as->n);
-
-notfound1:
-	continue;
-	}
-	if(buf2)free(buf2);
-	free(rbuf);
-	if(quiet)fdprintf_atomic(STDERR_FILENO,"\n");
-	return 0;
-}
-int search_cmp(int fdmap,int fdmem,const void *val,size_t len,struct addrset *as,int (*compar)(const void *,const void *)){
-	char *buf2,*rbuf,perms[sizeof("rwxp")],vmname[(BUFSIZE+1+15)&~15];
-	void *sa,*ea;
-	char *p,*pr;
-	size_t n,size,scanned=0,pct;
-	ssize_t sr;
-	int r0;
-	if(len==0)return 0;
-	buf2=NULL;
-	sr=readall(fdmap,(void **)&rbuf);
-	if(sr<0){
-		return (int)-sr;
-	}
-	sr=sizeofmap(rbuf);
-	pr=rbuf;
-	if(quiet)fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",0lu,as->n);
-	while(*pr&&freezing){
-	n=0;
-	p=strchr(pr,'\n');
-	if(p){
-		*p=0;
-	}
-	if(sscanf(pr,"%lx-%lx %s %*s %*s %*s %" TOCSTR(BUFSIZE) "[^\n]",(unsigned long *)&sa,(unsigned long *)&ea,perms,vmname)<4)vmname[0]=0;
-	pr+=strlen(pr)+1;
-	if(permscmp(perms,cperms)||!findkeyword(vmname))goto notfound1;
-	size=(size_t)ea-(size_t)sa;
-	scanned+=size;
-	pct=scanned*100/sr;
-	if(!quiet)fdprintf_atomic(STDERR_FILENO,"[%3zu%%] %lx-%lx %s ",pct,(uintptr_t)sa,(uintptr_t)ea,perms);
-	p=realloc(buf2,size);
-	if(!p){
-		r0=errno;
-		if(buf2)free(buf2);
-		free(rbuf);
-		return r0;
-	}
-	buf2=p;
-	if((r0=pread(fdmem,buf2,size,(off_t)sa))==0)goto notfound;
-	if(r0<0){
-		if(!quiet)fdprintf_atomic(STDERR_FILENO,"failed (%s) %s%s%s\n",strerror(errno),vmname[0]?"(":"",vmname,vmname[0]?")":"");
-		goto notfound1;
-	}
-	while((size_t)(p-buf2)<=size-len){
-		if(compar(p,val)){
-		++n;
-		if((r0=aset_addv(as,(off_t)((uintptr_t)sa+(p-buf2)),p,len))<0){
-			if(buf2)free(buf2);
-			free(rbuf);
-			return -r0;
-		}
-		}
-		p+=align;
-	}
-notfound:
-	if(!quiet)fdprintf_atomic(STDERR_FILENO,"-> %zu / %zu\t%s%s%s\n",n,as->n,vmname[0]?"(":"",vmname,vmname[0]?")":"");
-	else fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",pct,as->n);
-
-notfound1:
-	continue;
-	}
-	if(buf2)free(buf2);
-	free(rbuf);
-	if(quiet)fdprintf_atomic(STDERR_FILENO,"\n");
-	return 0;
-}
-int search_fuzzy(int fdmap,int fdmem,size_t len,struct addrset *as){
-	char *buf2,*rbuf,perms[sizeof("rwxp")],vmname[(BUFSIZE+1+15)&~15];
-	void *sa,*ea;
-	char *p,*pr;
-	size_t n,size,scanned=0,pct;
-	ssize_t sr;
-	int r0;
-	if(len==0)return 0;
-	buf2=NULL;
-	sr=readall(fdmap,(void **)&rbuf);
-	if(sr<0){
-		return (int)-sr;
-	}
-	sr=sizeofmap(rbuf);
-	pr=rbuf;
-	if(quiet)fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",0lu,as->n);
-	while(*pr&&freezing){
-	n=0;
-	p=strchr(pr,'\n');
-	if(p){
-		*p=0;
-	}
-	if(sscanf(pr,"%lx-%lx %s %*s %*s %*s %" TOCSTR(BUFSIZE) "[^\n]",(unsigned long *)&sa,(unsigned long *)&ea,perms,vmname)<4)vmname[0]=0;
-	pr+=strlen(pr)+1;
-	if(permscmp(perms,cperms)||!findkeyword(vmname))goto notfound1;
-	size=(size_t)ea-(size_t)sa;
-	scanned+=size;
-	pct=scanned*100/sr;
-	if(!quiet)fdprintf_atomic(STDERR_FILENO,"[%3zu%%] %lx-%lx %s ",pct,(uintptr_t)sa,(uintptr_t)ea,perms);
-	p=realloc(buf2,size);
-	if(!p){
-		r0=errno;
-		if(buf2)free(buf2);
-		free(rbuf);
-		return r0;
-	}
-	buf2=p;
-	if((r0=pread(fdmem,buf2,size,(off_t)sa))==0)goto notfound;
-	if(r0<0){
-		if(!quiet)fdprintf_atomic(STDERR_FILENO,"failed (%s) %s%s%s\n",strerror(errno),vmname[0]?"(":"",vmname,vmname[0]?")":"");
-		goto notfound1;
-	}
-	while((size_t)(p-buf2)<=size-len){
-		++n;
-		if((r0=aset_addv(as,(off_t)((uintptr_t)sa+(p-buf2)),p,len))<0){
-			if(buf2)free(buf2);
-			free(rbuf);
-			return -r0;
-		}
-		p+=align;
-	}
-notfound:
-	if(!quiet)fdprintf_atomic(STDERR_FILENO,"-> %zu / %zu\t%s%s%s\n",n,as->n,vmname[0]?"(":"",vmname,vmname[0]?")":"");
-	else fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",pct,as->n);
-
-notfound1:
-	continue;
-	}
-	if(buf2)free(buf2);
-	free(rbuf);
-	if(quiet)fdprintf_atomic(STDERR_FILENO,"\n");
-	return 0;
-}*/
 int atolodx(const char *restrict s,void *dst){
 	char *format="%lu";
 	if(*s=='0'&&s[1]&&!strchr("+-!=",s[1])){
@@ -1100,7 +907,7 @@ void help(char *arg){
 	"[i|u][8|16|32|64] !   -- scan signed/unsigned modified value\n"
 	"[i|u][8|16|32|64] !=  -- scan signed/unsigned non-modified value\n"
 	"\tthese operators can also work for float\n"
-	"\tthese will scan all value at first scanning,suggest using \"perms\" to limit the field to scan and \"align\" unless your machine is a quantum computer\n"
+	"\tthese will scan all value at first scanning,suggest using \"perms\" and \"key\" to limit the field to scan and \"align\" unless your machine is a quantum computer\n"
 	"ascii x -- scan continuous bytes equal to x\n"
 	"string x -- scan continuous bytes terminated by 0 equal to x\n"
 	"\nOther commands:\n"
@@ -1333,7 +1140,7 @@ back_to_next:
 				keywords[keylen]=0;
 			}
 			goto nextloop;
-		}//else if(ibuf[3]!=' ')goto invcmd;
+		};
 		memcpy(keywords,ibuf+4,(keylen=strlen(ibuf+4))+1);
 		goto nextloop;
 	}else if(!strcmp(cmd,"select")||!strcmp(cmd,"s")){
@@ -1671,7 +1478,7 @@ search_start:
 normal:
 	if(as.n){
 		aset_init(&as1);
-		r0=research(&as,fdmem,p,len,&as1);
+		r0=researchu(&as,fdmem,p,len,&as1,NULL);
 		if(r0){
 			fdprintf_atomic(STDERR_FILENO,"Failed:%s\n",strerror(r0));
 			goto err_search;
@@ -1691,7 +1498,7 @@ normal:
 compare:
 	if(as.n){
 		aset_init(&as1);
-		r0=research_cmp(&as,fdmem,p,len,&as1,cmp_matrix[vtype&1][vtype/2][cmpmode]);
+		r0=researchu(&as,fdmem,p,len,&as1,cmp_matrix[vtype&1][vtype/2][cmpmode]);
 		if(r0){
 			fdprintf_atomic(STDERR_FILENO,"Failed:%s\n",strerror(r0));
 			goto err_search;
@@ -1711,7 +1518,7 @@ compare:
 fuzzy:
 	if(as.n){
 		aset_init(&as1);
-		r0=research_fuzzy(&as,fdmem,len,&as1,cmp_matrix[vtype&1][vtype/2][cmpmode]);
+		r0=researchu(&as,fdmem,NULL,len,&as1,cmp_matrix[vtype&1][vtype/2][cmpmode]);
 		if(r0){
 			fdprintf_atomic(STDERR_FILENO,"Failed:%s\n",strerror(r0));
 			goto err_search;
