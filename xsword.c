@@ -4,7 +4,6 @@
  *******************************************************************************/
 #define _GNU_SOURCE
 #include <errno.h>
-#include <sched.h>
 #include <unistd.h>
 #include <time.h>
 #include <stdio.h>
@@ -13,7 +12,6 @@
 #include <stdarg.h>
 #include <limits.h>
 #include <dirent.h>
-#include <math.h>
 #define VT_I8 0
 #define VT_U8 1
 #define VT_I16 2
@@ -35,13 +33,15 @@
 #define VBUFSIZE (sizeof(long double)>sizeof(uintmax_t)?sizeof(long double):sizeof(uintmax_t))
 #define TOCSTR(x) TOCSTR0(x)
 #define TOCSTR0(x) #x
-float error_float=0.001f;
-double error_double=0.000001;
-long double error_ldouble=0.000000001l;
+enum smode {SEARCH_NORMAL,SEARCH_COMPARE,SEARCH_FUZZY,SEARCH_FUZZYFIX};
+float epsilon_float=FLT_EPSILON;
+double epsilon_double=DBL_EPSILON;
+long double epsilon_ldouble=LDBL_EPSILON;
 volatile sig_atomic_t freezing=0;
 volatile sig_atomic_t nnext=1;
 char buf_stdout[BUFSIZE_STDOUT];
 char keywords[BUFSIZE];
+const char space[256]={[0 ... 255]=' '};
 size_t keylen=0;
 char cperms[8]={"****"};
 size_t align=1;
@@ -55,6 +55,9 @@ struct addrset {
 	size_t size,n;
 	int valued;
 };
+size_t minz(size_t s1,size_t s2){
+	return s1>s2?s2:s1;
+}
 const char *bfname(const char *path){
 	const char *p;
 	if(path[0]=='/'&&path[1]=='\0')return path;
@@ -180,7 +183,7 @@ void aset_wipe(struct addrset *restrict aset){
 }
 void aset_list(struct addrset *restrict aset,int fdmem,int vtype,size_t len){
 	size_t i;
-	char *buf,fbuf[256];
+	char *buf,fbuf[((LDBL_MAX_10_EXP+128+16+15)&~15)];
 	int64_t l;
 	uint64_t u;
 	int toa=0,r;
@@ -534,13 +537,13 @@ int cmpltf(const void *d,const void *s){
 	return *(float *)d<*(float *)s;
 }
 int cmplef(const void *d,const void *s){
-	return *(float *)d<=*(float *)s+error_float;
+	return *(float *)d<=*(float *)s+epsilon_float;
 }
 int cmpgtf(const void *d,const void *s){
 	return *(float *)d>*(float *)s;
 }
 int cmpgef(const void *d,const void *s){
-	return *(float *)d>=*(float *)s-error_float;
+	return *(float *)d>=*(float *)s-epsilon_float;
 }
 int cmpnef(const void *d,const void *s){
 	return !cmplef(d,s)||!cmpgef(d,s);
@@ -552,13 +555,13 @@ int cmpltd(const void *d,const void *s){
 	return *(double *)d<*(double *)s;
 }
 int cmpled(const void *d,const void *s){
-	return *(double *)d<=*(double *)s+error_double;
+	return *(double *)d<=*(double *)s+epsilon_double;
 }
 int cmpgtd(const void *d,const void *s){
 	return *(double *)d>*(double *)s;
 }
 int cmpged(const void *d,const void *s){
-	return *(double *)d>=*(double *)s-error_double;
+	return *(double *)d>=*(double *)s-epsilon_double;
 }
 int cmpned(const void *d,const void *s){
 	return !cmpled(d,s)||!cmpged(d,s);
@@ -570,13 +573,13 @@ int cmpltld(const void *d,const void *s){
 	return *(long double *)d<*(long double *)s;
 }
 int cmpleld(const void *d,const void *s){
-	return *(long double *)d<=*(long double *)s+error_ldouble;
+	return *(long double *)d<=*(long double *)s+epsilon_ldouble;
 }
 int cmpgtld(const void *d,const void *s){
 	return *(long double *)d>*(long double *)s;
 }
 int cmpgeld(const void *d,const void *s){
-	return *(long double *)d>=*(long double *)s-error_ldouble;
+	return *(long double *)d>=*(long double *)s-epsilon_ldouble;
 }
 int cmpneld(const void *d,const void *s){
 	return !cmpleld(d,s)||!cmpgeld(d,s);
@@ -667,6 +670,7 @@ size_t sizeofmap(const char *pr){
 	char perms[sizeof("rwxp")],vmname[(BUFSIZE+1+15)&~15],buf[(BUFSIZE+1+15)&~15];
 	void *sa,*ea;
 	size_t ret=0;
+
 	while(*pr){
 	p=strchr(pr,'\n');
 	if(!p)return ret;
@@ -684,16 +688,26 @@ size_t sizeofmap(const char *pr){
 	}
 	return ret;
 }
-int researchu(const struct addrset *restrict oldas,int fdmem,const void *val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
+int researchu(enum smode search_mode,const struct addrset *restrict oldas,int fdmem,const void *val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
 	size_t i=0,n=0,pct,pct_old=0;
 	char *buf=NULL;
-	int r0;
+	int r0,r1;
+	int64_t l,l1;
+	uint64_t u,u1;
 	buf=malloc((len+15)&~15);
 	if(!buf)return errno;
 	while(i<oldas->n&&freezing){
 		if(pread(fdmem,buf,len,oldas->buf[i].addr)==len){
-			if(!val)goto fuzzy;
-			if(compar)goto compare;
+			switch(search_mode){
+				case SEARCH_COMPARE:
+					goto compare;
+				case SEARCH_FUZZY:
+					goto fuzzy;
+				case SEARCH_FUZZYFIX:
+					goto fuzzy_fix;
+				default:
+					break;
+			}
 		}else goto end;
 		if(!memcmp(buf,val,len)){
 			r0=aset_addv(as,oldas->buf[i].addr,val,len);
@@ -721,7 +735,29 @@ fuzzy:
 			}
 			++n;
 		}
-
+		goto end;
+fuzzy_fix:
+			l=(buf[len-1]&0x80)?-1:0;
+			memcpy(&l,buf,len);
+			u=0;
+			memcpy(&u,buf,len);
+			l1=(oldas->buf[i].val[len-1]&0x80)?-1:0;
+			memcpy(&l1,oldas->buf[i].val,len);
+			u1=0;
+			memcpy(&u1,oldas->buf[i].val,len);
+			l-=l1;
+			u-=u1;
+			l1=(((char *)val)[len-1]&0x80)?-1:0;
+			memcpy(&l1,val,len);
+			u1=0;
+			memcpy(&u1,val,len);
+		if(u==u1||l==l1){
+			if((r0=aset_addv(as,oldas->buf[i].addr,buf,len))<0){
+				free(buf);
+				return -r0;
+			}
+			++n;
+		}
 		goto end;
 end:
 		++i;
@@ -735,13 +771,13 @@ end:
 	free(buf);
 	return 0;
 }
-int searchu(int fdmap,int fdmem,void *val,size_t len,struct addrset *as,int (*compar)(const void *,const void *)){
+int searchu(enum smode search_mode,int fdmap,int fdmem,void *val,size_t len,struct addrset *as,int (*compar)(const void *,const void *)){
 	char *buf2,*rbuf,perms[sizeof("rwxp")],vmname[(BUFSIZE+1+15)&~15];
 	void *sa,*ea;
 	char *p,*pr;
-	size_t n,size,scanned=0,pct;
+	size_t n,size,scanned=0,pct,lline,maxlline=0;
 	ssize_t sr;
-	int r0;
+	int r0,r1;
 	if(len==0)return 0;
 	buf2=NULL;
 	sr=readall(fdmap,(void **)&rbuf);
@@ -763,7 +799,8 @@ int searchu(int fdmap,int fdmem,void *val,size_t len,struct addrset *as,int (*co
 	size=(size_t)ea-(size_t)sa;
 	scanned+=size;
 	pct=scanned*100/sr;
-	if(!quiet)fdprintf_atomic(STDERR_FILENO,"[%3zu%%] %lx-%lx %s ",pct,(uintptr_t)sa,(uintptr_t)ea,perms);
+	lline=0;
+	if(!quiet)lline+=fdprintf_atomic(STDERR_FILENO,"[%3zu%%] %lx-%lx %s",pct,(uintptr_t)sa,(uintptr_t)ea,perms);
 	p=realloc(buf2,size);
 	if(!p){
 		r0=errno;
@@ -773,14 +810,24 @@ int searchu(int fdmap,int fdmem,void *val,size_t len,struct addrset *as,int (*co
 	}
 	buf2=p;
 	if((r0=pread(fdmem,buf2,size,(off_t)sa))==0)goto notfound;
-	if(!quiet)write(STDERR_FILENO,"-> ",3);
+	r1=errno;
+	if(!quiet)lline+=write(STDERR_FILENO," -> ",4);
 	if(r0<0){
-		if(!quiet)fdprintf_atomic(STDERR_FILENO,"failed (%s) %s%s%s\n",strerror(errno),vmname[0]?"(":"",vmname,vmname[0]?")":"");
+		if(!quiet){
+			lline+=fdprintf_atomic(STDERR_FILENO,"failed (%s)",strerror(r1));
+			goto notfound2;
+		}
 		goto notfound1;
 	}
-	if(!val)goto fuzzy;
-	if(compar)goto compare;
-normal:
+	switch(search_mode){
+		case SEARCH_COMPARE:
+			goto compare;
+		case SEARCH_FUZZY:
+		case SEARCH_FUZZYFIX:
+			goto fuzzy;
+		default:
+			break;
+	}
 	while((p=memmem_aligned(p,size-(size_t)(p-buf2),val,len,align))){
 		++n;
 		if((r0=aset_addv(as,(off_t)((uintptr_t)sa+(p-buf2)),val,len))<0){
@@ -818,7 +865,16 @@ fuzzy:
 	goto end;
 end:
 notfound:
-	if(!quiet)fdprintf_atomic(STDERR_FILENO,"%zu / %zu\t%s%s%s\n",n,as->n,vmname[0]?"(":"",vmname,vmname[0]?")":"");
+	if(!quiet){
+		lline+=fdprintf_atomic(STDERR_FILENO,"%zu / %zu",n,as->n);
+notfound2:
+		if(vmname[0]){
+		if(lline>=maxlline)maxlline=lline;
+		else write(STDERR_FILENO,space,minz(maxlline-lline,sizeof(space)));
+		fdprintf_atomic(STDERR_FILENO,"\t(%s)",vmname);
+		}
+		write(STDERR_FILENO,"\n",1);
+	}
 	else fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",pct,as->n);
 
 notfound1:
@@ -888,6 +944,7 @@ void help(char *arg){
 	"List of all commands:\n\n"
 	"Scanning commands:\n"
 	"[i|u][8|16|32|64] x   -- scan signed/unsigned value with the specified bits equal to x\n"
+	"[i|u][8|16|32|64] x ~ -- like the prev,but x is a variation\n"
 	"float x               -- scan float value equal to x\n"
 	"double x              -- scan double value equal to x\n"
 	"ldouble x             -- scan long double value equal to x\n"
@@ -899,7 +956,7 @@ void help(char *arg){
 	"[i|u][8|16|32|64] x!= -- scan signed/unsigned value equal to x\n"
 	"\tfor interger \"x!=\" is equivalent to \"x\" but maybe slower\n"
 	"\tfor float \"x!=\" allows error value and \"x\" not\n"
-	"\tother compar operators can also work for float\n"
+	"\tother compar operators(excluding \"~\") can also work for float\n"
 	"[i|u][8|16|32|64] -   -- scan signed/unsigned decreased value\n"
 	"[i|u][8|16|32|64] -=  -- scan signed/unsigned non-increased value\n"
 	"[i|u][8|16|32|64] +   -- scan signed/unsigned increased value\n"
@@ -911,22 +968,26 @@ void help(char *arg){
 	"ascii x -- scan continuous bytes equal to x\n"
 	"string x -- scan continuous bytes terminated by 0 equal to x\n"
 	"\nOther commands:\n"
-	"align [x] -- show or set the aligning bytes\n"
+	"align,a [x] -- show or set the aligning bytes\n"
 	"autoexit,--autoexit,-e -- exit if no value hit in scanning\n"
 	"autostop,--autostop,-s -- send SIGSTOP before scanning and SIGCONT after it\n"
+	"cont,c -- send SIGCONT\n"
 	"exit,quit,q -- exit\n"
 	"echo x -- print x\n"
 	"echon x -- print x without \\n\n"
 	"out x -- print x to stdout\n"
 	"outn x -- print x to stdout without \\n\n"
-	"efloat [x] -- show or set the error value for scanning float value\n"
-	"edouble [x] -- show or set the error value for scanning double value\n"
-	"eldouble [x] -- show or set the error value for scanning long double value\n"
-	"ftimer,t x -- use x(decimal,second) as the interval in \"freeze\",default 0.125\n"
+	"efloat [x] -- show or set the epsilon value for scanning float value\n"
+	"edouble [x] -- show or set the epsilon value for scanning double value\n"
+	"eldouble [x] -- show or set the epsilon value for scanning long double value\n"
+	"\tdefault FLT_EPSILON/DBL_EPSILON/LDBL_EPSILON\n"
+	"ftimer,ft x -- use x(decimal,second) as the interval in \"freeze\",default 0.125\n"
 	"freeze,f x -- write x to hit addresses looply\n"
 	"help,h,usage -- print this help\n"
 	"key [x] -- show or set keyword to x used for first scanning,matched with vmname,separated by space\n"
+	"kill,k [x] -- send signal x,default SIGKILL\n"
 	"list,l,ls -- list values hit\n"
+	"ln -- show number of values hit\n"
 	"nest,n [x|inf] -- redo the lasted command 1 or x times,or endless until SIGINT gained\n"
 	"perms,p [x] -- show or set the perms filter used at first scanning to x\n"
 	"\tx must be [r|-|*][w|-|*][x|-|*][s|p|*],r:read,w:write,x:execute,s:shared,p:private(copy-on-write),*:any,-:forbidden\n"
@@ -934,8 +995,9 @@ void help(char *arg){
 	"outpid -- print pid of target process to stdout\n"
 	"quiet,--quiet,-q -- print less information at first scanning\n"
 	"reset,r -- wipe values hit\n"
-	"select x1,x2,... -- hit listed address\n"
+	"select,se x1,x2,... -- hit listed address\n"
 	"sleep x -- enter the TASK_INTERRUPTIBLE state for x(decimal) seconds\n"
+	"stop,s -- send SIGSTOP\n"
 	"write,w x -- write x to hit addresses\n"
 	"\ncommands can be appended after %s <pid> ,which will automatically do at beginning\n"
 	,arg);
@@ -970,7 +1032,8 @@ void psig(int sig){
 int main(int argc,char **argv){
 	int fdmem,fdmap,cmpmode,vtype=VT_U8,r0;
 	char autoexit=0,autostop=0;
-	void *back=NULL,*search_mode;
+	void *back=NULL;
+	enum smode search_mode;
 	char pid_str[BUFSIZE_PATH],*p,*p1,*format;
 	pid_t pid;
 	char buf[BUFSIZE_PATH];
@@ -979,17 +1042,19 @@ int main(int argc,char **argv){
 	char cmd_last[BUFSIZE];
 	char vbuf[VBUFSIZE];
 	char fbuf[256];
+	char last_type[16];
 	struct addrset as,as1;
 	struct timespec sleepts;
 	size_t len,slen,n2;
 	long l,i;
 	off_t addr;
+	last_type[0]=0;
 	if(argc<2||!strcmp(argv[1],"--help")){
 		fdprintf_atomic(STDERR_FILENO,
 	"License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n"
 	"This is free software: you are free to change and redistribute it.\n"
 
-				"Usage: %s <pid>\n",argv[0]);
+	"Usage: %s <pid>\n",argv[0]);
 		return 0;
 	}else if(argc==2)fdprintf_atomic(STDERR_FILENO,
 	"License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n"
@@ -1025,7 +1090,7 @@ here:
 		back=NULL;
 	}
 	for(;;){
-	fdprintf_atomic(STDERR_FILENO,"%s>",argv[0]);
+	fdprintf_atomic(STDERR_FILENO,"%s>",last_type[0]?last_type:argv[0]);
 	if(read(STDIN_FILENO,ibuf,BUFSIZE)<=0)break;
 gotcmd:
 	p=memchr(ibuf,'\n',BUFSIZE);
@@ -1081,6 +1146,28 @@ back_to_next:
 	}else if(!strcmp(cmd,"help")||!strcmp(cmd,"h")||!strcmp(cmd,"usage")){
 		help(argv[0]);
 		goto nextloop;
+	}else if(!strcmp(cmd,"stop")||!strcmp(cmd,"s")){
+		if(kill(pid,SIGSTOP)<0)fdprintf_atomic(STDERR_FILENO,"kill failed (%s)\n",strerror(errno));
+		goto nextloop;
+	}else if(!strcmp(cmd,"cont")||!strcmp(cmd,"c")){
+		if(kill(pid,SIGCONT)<0)fdprintf_atomic(STDERR_FILENO,"kill failed (%s)\n",strerror(errno));
+		goto nextloop;
+	}else if(!strcmp(cmd,"kill")||!strcmp(cmd,"k")){
+		strtok(ibuf," \t");
+		p=strtok(NULL," \t");
+		if(p){
+			if(atolodx(p,&l)==1){
+				r0=(int)l;
+			}
+			else {
+				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
+				goto nextloop;
+			}
+		}else {
+			r0=SIGKILL;
+		}
+		if(kill(pid,r0)<0)fdprintf_atomic(STDERR_FILENO,"kill failed (%s)\n",strerror(errno));
+		goto nextloop;
 	}else if(!strcmp(cmd,"list")||!strcmp(cmd,"l")||!strcmp(cmd,"ls")){
 		aset_list(&as,fdmem,vtype,slen);
 		goto nextloop;
@@ -1100,7 +1187,7 @@ back_to_next:
 			goto nextloop;
 		}
 		goto invcmd;
-	}else if(!strcmp(cmd,"ftimer")||!strcmp(cmd,"ftimer")){
+	}else if(!strcmp(cmd,"ftimer")||!strcmp(cmd,"ft")){
 		strtok(ibuf," \t");
 		if((p=strtok(NULL," \t"))&&dat2spec(p,&freezing_timer)>0){
 			goto nextloop;
@@ -1143,7 +1230,7 @@ back_to_next:
 		};
 		memcpy(keywords,ibuf+4,(keylen=strlen(ibuf+4))+1);
 		goto nextloop;
-	}else if(!strcmp(cmd,"select")||!strcmp(cmd,"s")){
+	}else if(!strcmp(cmd,"select")||!strcmp(cmd,"se")){
 		aset_wipe(&as);
 		strtok(ibuf," \t");
 		while((p=strtok(NULL," \t"))){
@@ -1214,7 +1301,9 @@ fnum:
 			default:
 				break;
 		}
+		if(autostop&&!freezing)kill(pid,SIGSTOP);
 		aset_write(&as,fdmem,p,len);
+		if(autostop&&!freezing)kill(pid,SIGCONT);
 		if(freezing){
 			while(freezing){
 			nanosleep(&freezing_timer,NULL);
@@ -1236,7 +1325,8 @@ back_to_freeze:
 		len-=2;
 		goto from_f;
 	}else if(!strcmp(cmd,"reset")||!strcmp(cmd,"r")){
-reset:
+		last_type[0]=0;
+		fdprintf_atomic(STDERR_FILENO,"wiped %zu addresses\n",as.n);
 		aset_wipe(&as);
 		goto nextloop;
 	}else if(!strcmp(cmd,"perms")||!strcmp(cmd,"p")){
@@ -1249,12 +1339,14 @@ reset:
 			else {
 				fdprintf_atomic(STDERR_FILENO,"invaild value %s\nuse [-r\\*][-w\\*][-x\\*][sp\\*]\n",p);
 			}
-		}else {
-			
+		}else if(!p){
 			fdprintf_atomic(STDERR_FILENO,"%4s\n",cperms);
-		}
+		}else fdprintf_atomic(STDERR_FILENO,"invaild value %s\nuse [-r\\*][-w\\*][-x\\*][sp\\*]\n",p);
 		goto nextloop;
-	}else if(!strcmp(cmd,"align")){
+	}else if(!strcmp(cmd,"ln")){
+		fdprintf_atomic(STDERR_FILENO,"hit %zu in summary\n",as.n);
+		goto nextloop;
+	}else if(!strcmp(cmd,"align")||!strcmp(cmd,"a")){
 		strtok(ibuf," \t");
 		p=strtok(NULL," \t");
 		if(p){
@@ -1273,11 +1365,11 @@ reset:
 		strtok(ibuf," \t");
 		p=strtok(NULL," \t");
 		if(p){
-			if(sscanf(p,"%f",&error_float)<1){
+			if(sscanf(p,"%f",&epsilon_float)<1){
 				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
 			}
 		}else {
-			r0=sprintf(fbuf,"%.128f",error_float);
+			r0=sprintf(fbuf,"%.128f",epsilon_float);
 			fbuf[r0]='0';
 			while(fbuf[--r0]=='0');
 			fbuf[r0+2]='\n';
@@ -1288,11 +1380,11 @@ reset:
 		strtok(ibuf," \t");
 		p=strtok(NULL," \t");
 		if(p){
-			if(sscanf(p,"%lf",&error_double)<1){
+			if(sscanf(p,"%lf",&epsilon_double)<1){
 				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
 			}
 		}else {
-			r0=sprintf(fbuf,"%.128lf",error_double);
+			r0=sprintf(fbuf,"%.128lf",epsilon_double);
 			fbuf[r0]='0';
 			while(fbuf[--r0]=='0');
 			fbuf[r0+2]='\n';
@@ -1303,11 +1395,11 @@ reset:
 		strtok(ibuf," \t");
 		p=strtok(NULL," \t");
 		if(p){
-			if(sscanf(p,"%Lf",&error_ldouble)<1){
+			if(sscanf(p,"%Lf",&epsilon_ldouble)<1){
 				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
 			}
 		}else {
-			r0=sprintf(fbuf,"%.128Lf",error_ldouble);
+			r0=sprintf(fbuf,"%.128Lf",epsilon_ldouble);
 			fbuf[r0]='0';
 			while(fbuf[--r0]=='0');
 			fbuf[r0+2]='\n';
@@ -1316,36 +1408,40 @@ reset:
 		goto nextloop;
 	}else if(!strcmp(cmd,"ascii")){
 		vtype=VT_ASCII;
+		strcpy(last_type,cmd);
 		if(ibuf[5]==0){
 			goto nextloop;
 		}else if(ibuf[5]!=' ')goto invcmd;
 		p=ibuf+6;
 		slen=len-=6;
-		search_mode=&&normal;
+		search_mode=SEARCH_NORMAL;
 		goto search_start;
 	}else if(!strcmp(cmd,"string")){
 		vtype=VT_STR;
+		strcpy(last_type,cmd);
 		if(ibuf[6]==0){
 			goto nextloop;
 		}else if(ibuf[6]!=' ')goto invcmd;
 		p=ibuf+7;
 		slen=len-=7;
 		++len;
-		search_mode=&&normal;
+		search_mode=SEARCH_NORMAL;
 		goto search_start;
 	}else if(!strcmp(cmd,"i8")||!strcmp(cmd,"u8")){
 		vtype=cmd[0]=='i'?VT_I8:VT_U8;
+		strcpy(last_type,cmd);
 		strtok(ibuf," \t");
 		p1=strtok(NULL," \t");
-		search_mode=&&normal;
+		search_mode=SEARCH_NORMAL;
 		if(p1){
 			len=sizeof(int8_t);
 			if(atolodxs(p1,vbuf,!(vtype&1))==1){
 				p=vbuf;
-				if(getcmpmode(p1,&cmpmode))search_mode=&&compare;
+				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
+				else if((p1=strtok(NULL," \t"))&&*p1=='~')search_mode=SEARCH_FUZZYFIX;
 			}
 			else if(getfuzzymode(p1,&cmpmode)){
-				search_mode=&&fuzzy;
+				search_mode=SEARCH_FUZZY;
 			}else {
 				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
 				goto nextloop;
@@ -1354,17 +1450,19 @@ reset:
 		goto search_start;
 	}else if(!strcmp(cmd,"i16")||!strcmp(cmd,"u16")){
 		vtype=cmd[0]=='i'?VT_I16:VT_U16;
+		strcpy(last_type,cmd);
 		strtok(ibuf," \t");
 		p1=strtok(NULL," \t");
-		search_mode=&&normal;
+		search_mode=SEARCH_NORMAL;
 		if(p1){
 			len=sizeof(int16_t);
 			if(atolodxs(p1,vbuf,!(vtype&1))==1){
 				p=vbuf;
-				if(getcmpmode(p1,&cmpmode))search_mode=&&compare;
+				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
+				else if((p1=strtok(NULL," \t"))&&*p1=='~')search_mode=SEARCH_FUZZYFIX;
 			}
 			else if(getfuzzymode(p1,&cmpmode)){
-				search_mode=&&fuzzy;
+				search_mode=SEARCH_FUZZY;
 			}else {
 				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
 				goto nextloop;
@@ -1373,17 +1471,19 @@ reset:
 		goto search_start;
 	}else if(!strcmp(cmd,"i32")||!strcmp(cmd,"u32")){
 		vtype=cmd[0]=='i'?VT_I32:VT_U32;
+		strcpy(last_type,cmd);
 		strtok(ibuf," \t");
 		p1=strtok(NULL," \t");
-		search_mode=&&normal;
+		search_mode=SEARCH_NORMAL;
 		if(p1){
 			len=sizeof(int32_t);
 			if(atolodxs(p1,vbuf,!(vtype&1))==1){
 				p=vbuf;
-				if(getcmpmode(p1,&cmpmode))search_mode=&&compare;
+				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
+				else if((p1=strtok(NULL," \t"))&&*p1=='~')search_mode=SEARCH_FUZZYFIX;
 			}
 			else if(getfuzzymode(p1,&cmpmode)){
-				search_mode=&&fuzzy;
+				search_mode=SEARCH_FUZZY;
 			}else {
 				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
 				goto nextloop;
@@ -1392,17 +1492,19 @@ reset:
 		goto search_start;
 	}else if(!strcmp(cmd,"i64")||!strcmp(cmd,"u64")){
 		vtype=cmd[0]=='i'?VT_I64:VT_U64;
+		strcpy(last_type,cmd);
 		strtok(ibuf," \t");
 		p1=strtok(NULL," \t");
-		search_mode=&&normal;
+		search_mode=SEARCH_NORMAL;
 		if(p1){
 			len=sizeof(int64_t);
 			if(atolodxs(p1,vbuf,!(vtype&1))==1){
 				p=vbuf;
-				if(getcmpmode(p1,&cmpmode))search_mode=&&compare;
+				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
+				else if((p1=strtok(NULL," \t"))&&*p1=='~')search_mode=SEARCH_FUZZYFIX;
 			}
 			else if(getfuzzymode(p1,&cmpmode)){
-				search_mode=&&fuzzy;
+				search_mode=SEARCH_FUZZY;
 			}else {
 				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
 				goto nextloop;
@@ -1411,17 +1513,19 @@ reset:
 		goto search_start;
 	}else if(!strcmp(cmd,"float")){
 		vtype=VT_FLOAT;
+		strcpy(last_type,cmd);
 		strtok(ibuf," \t");
 		p1=strtok(NULL," \t");
-		search_mode=&&normal;
+		search_mode=SEARCH_NORMAL;
 		if(p1){
 			len=sizeof(float);
 			if(sscanf(p1,"%f",(float *)vbuf)==1){
 				p=vbuf;
-				if(getcmpmode(p1,&cmpmode))search_mode=&&compare;
+				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
+				else if((p1=strtok(NULL," \t"))&&*p1=='~')search_mode=SEARCH_FUZZYFIX;
 			}
 			else if(getfuzzymode(p1,&cmpmode)){
-				search_mode=&&fuzzy;
+				search_mode=SEARCH_FUZZY;
 			}else {
 				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
 				goto nextloop;
@@ -1430,17 +1534,18 @@ reset:
 		goto search_start;
 	}else if(!strcmp(cmd,"double")){
 		vtype=VT_DOUBLE;
+		strcpy(last_type,cmd);
 		strtok(ibuf," \t");
 		p1=strtok(NULL," \t");
-		search_mode=&&normal;
+		search_mode=SEARCH_NORMAL;
 		if(p1){
 			len=sizeof(double);
 			if(sscanf(p1,"%lf",(double *)vbuf)==1){
 				p=vbuf;
-				if(getcmpmode(p1,&cmpmode))search_mode=&&compare;
+				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
 			}
 			else if(getfuzzymode(p1,&cmpmode)){
-				search_mode=&&fuzzy;
+				search_mode=SEARCH_FUZZY;
 			}else {
 				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
 				goto nextloop;
@@ -1449,17 +1554,18 @@ reset:
 		goto search_start;
 	}else if(!strcmp(cmd,"ldouble")){
 		vtype=VT_LDOUBLE;
+		strcpy(last_type,cmd);
 		strtok(ibuf," \t");
 		p1=strtok(NULL," \t");
-		search_mode=&&normal;
+		search_mode=SEARCH_NORMAL;
 		if(p1){
 			len=sizeof(long double);
 			if(sscanf(p1,"%Lf",(long double *)vbuf)==1){
 				p=vbuf;
-				if(getcmpmode(p1,&cmpmode))search_mode=&&compare;
+				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
 			}
 			else if(getfuzzymode(p1,&cmpmode)){
-				search_mode=&&fuzzy;
+				search_mode=SEARCH_FUZZY;
 			}else {
 				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
 				goto nextloop;
@@ -1467,6 +1573,11 @@ reset:
 		}else goto nextloop;
 		goto search_start;
 	}else {
+		if(last_type[0]){
+			sprintf(cmd,"%s %s",last_type,ibuf);
+			strcpy(ibuf,cmd);
+			goto gotcmd;
+		}
 invcmd:
 		fdprintf_atomic(STDERR_FILENO,"invaild or incompleted command\n");
 		goto nextloop;
@@ -1474,11 +1585,9 @@ invcmd:
 search_start:
 	freezing=1;
 	if(autostop)kill(pid,SIGSTOP);
-	goto *search_mode;
-normal:
 	if(as.n){
 		aset_init(&as1);
-		r0=researchu(&as,fdmem,p,len,&as1,NULL);
+		r0=researchu(search_mode,&as,fdmem,p,len,&as1,cmp_matrix[vtype&1][vtype/2][cmpmode]);
 		if(r0){
 			fdprintf_atomic(STDERR_FILENO,"Failed:%s\n",strerror(r0));
 			goto err_search;
@@ -1487,58 +1596,18 @@ normal:
 		memcpy(&as,&as1,sizeof(struct addrset));
 
 	}else{
-		r0=searchu(fdmap,fdmem,p,len,&as,NULL);
+		r0=searchu(search_mode,fdmap,fdmem,p,len,&as,cmp_matrix[vtype&1][vtype/2][cmpmode]);
 		if(r0){
 			fdprintf_atomic(STDERR_FILENO,"Failed:%s\n",strerror(r0));
 			goto err_search;
 		}
 		fdprintf_atomic(STDERR_FILENO,"hit %zu in summary\n",as.n);
 	}
-	goto search_end;
-compare:
-	if(as.n){
-		aset_init(&as1);
-		r0=researchu(&as,fdmem,p,len,&as1,cmp_matrix[vtype&1][vtype/2][cmpmode]);
-		if(r0){
-			fdprintf_atomic(STDERR_FILENO,"Failed:%s\n",strerror(r0));
-			goto err_search;
-		}
-		aset_free(&as);
-		memcpy(&as,&as1,sizeof(struct addrset));
-
-	}else{
-		r0=searchu(fdmap,fdmem,p,len,&as,cmp_matrix[vtype&1][vtype/2][cmpmode]);
-		if(r0){
-			fdprintf_atomic(STDERR_FILENO,"Failed:%s\n",strerror(r0));
-			goto err_search;
-		}
-		fdprintf_atomic(STDERR_FILENO,"hit %zu in summary\n",as.n);
-	}
-	goto search_end;
-fuzzy:
-	if(as.n){
-		aset_init(&as1);
-		r0=researchu(&as,fdmem,NULL,len,&as1,cmp_matrix[vtype&1][vtype/2][cmpmode]);
-		if(r0){
-			fdprintf_atomic(STDERR_FILENO,"Failed:%s\n",strerror(r0));
-			goto err_search;
-		}
-		aset_free(&as);
-		memcpy(&as,&as1,sizeof(struct addrset));
-
-	}else{
-		r0=searchu(fdmap,fdmem,NULL,len,&as,NULL);
-		if(r0){
-			fdprintf_atomic(STDERR_FILENO,"Failed:%s\n",strerror(r0));
-			goto err_search;
-		}
-		fdprintf_atomic(STDERR_FILENO,"hit %zu in summary\n",as.n);
-	}
-	goto search_end;
-search_end:
 		freezing=0;
 		if(autostop)kill(pid,SIGCONT);
-		if(!as.n&&autoexit)goto err3;
+		if(!as.n){
+			if(autoexit)goto err3;
+		}
 nextloop:
 		if(back)goto *back;
 		continue;
