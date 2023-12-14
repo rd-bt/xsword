@@ -39,6 +39,7 @@ double epsilon_double=DBL_EPSILON;
 long double epsilon_ldouble=LDBL_EPSILON;
 volatile sig_atomic_t freezing=0;
 volatile sig_atomic_t nnext=1;
+char fbuf[((LDBL_MAX_10_EXP+128+16+15)&~15)];
 char buf_stdout[BUFSIZE_STDOUT];
 char keywords[BUFSIZE];
 const char space[256]={[0 ... 255]=' '};
@@ -183,7 +184,7 @@ void aset_wipe(struct addrset *restrict aset){
 }
 void aset_list(struct addrset *restrict aset,int fdmem,int vtype,size_t len){
 	size_t i;
-	char *buf,fbuf[((LDBL_MAX_10_EXP+128+16+15)&~15)];
+	char *buf;
 	int64_t l;
 	uint64_t u;
 	int toa=0,r;
@@ -823,8 +824,8 @@ int searchu(enum smode search_mode,int fdmap,int fdmem,void *val,size_t len,stru
 		case SEARCH_COMPARE:
 			goto compare;
 		case SEARCH_FUZZY:
-		case SEARCH_FUZZYFIX:
 			goto fuzzy;
+		case SEARCH_FUZZYFIX:
 		default:
 			break;
 	}
@@ -987,6 +988,7 @@ void help(char *arg){
 	"key [x] -- show or set keyword to x used for first scanning,matched with vmname,separated by space\n"
 	"kill,k [x] -- send signal x,default SIGKILL\n"
 	"list,l,ls -- list values hit\n"
+	"limit -- list limits of types\n"
 	"ln -- show number of values hit\n"
 	"nest,n [x|inf] -- redo the lasted command 1 or x times,or endless until SIGINT gained\n"
 	"perms,p [x] -- show or set the perms filter used at first scanning to x\n"
@@ -998,6 +1000,7 @@ void help(char *arg){
 	"select,se x1,x2,... -- hit listed address\n"
 	"sleep x -- enter the TASK_INTERRUPTIBLE state for x(decimal) seconds\n"
 	"stop,s -- send SIGSTOP\n"
+	"update,u -- update recorded values\n"
 	"write,w x -- write x to hit addresses\n"
 	"\ncommands can be appended after %s <pid> ,which will automatically do at beginning\n"
 	,arg);
@@ -1029,6 +1032,9 @@ void psig(int sig){
 			break;
 	}
 }
+char ibuf[((LDBL_MAX_10_EXP+128+16+15)&~15)];
+char cmd[BUFSIZE];
+char cmd_last[BUFSIZE];
 int main(int argc,char **argv){
 	int fdmem,fdmap,cmpmode,vtype=VT_U8,r0;
 	char autoexit=0,autostop=0;
@@ -1037,11 +1043,7 @@ int main(int argc,char **argv){
 	char pid_str[BUFSIZE_PATH],*p,*p1,*format;
 	pid_t pid;
 	char buf[BUFSIZE_PATH];
-	char ibuf[BUFSIZE];
-	char cmd[BUFSIZE];
-	char cmd_last[BUFSIZE];
 	char vbuf[VBUFSIZE];
-	char fbuf[256];
 	char last_type[16];
 	struct addrset as,as1;
 	struct timespec sleepts;
@@ -1230,6 +1232,9 @@ back_to_next:
 		};
 		memcpy(keywords,ibuf+4,(keylen=strlen(ibuf+4))+1);
 		goto nextloop;
+	}else if(!strcmp(cmd,"update")||!strcmp(cmd,"u")){
+		aset_wlist(&as,fdmem,vtype);
+		goto nextloop;
 	}else if(!strcmp(cmd,"select")||!strcmp(cmd,"se")){
 		aset_wipe(&as);
 		strtok(ibuf," \t");
@@ -1345,6 +1350,22 @@ back_to_freeze:
 		goto nextloop;
 	}else if(!strcmp(cmd,"ln")){
 		fdprintf_atomic(STDERR_FILENO,"hit %zu in summary\n",as.n);
+		goto nextloop;
+	}else if(!strcmp(cmd,"limit")){
+		fprintf(stdout,
+				"i8:%hhd - %hhd\n"
+				"u8:%hhu\n"
+				"i16:%hd - %hd\n"
+				"u16:%hu\n"
+				"i32:%d - %d\n"
+				"u32:%u\n"
+				"i64:%ld - %ld\n"
+				"u64:%lu\n"
+				"float:%f\n"
+				"double:%lf\n"
+				"ldouble:%Lf\n"
+				,INT8_MIN,INT8_MAX,UINT8_MAX,INT16_MIN,INT16_MAX,UINT16_MAX,INT32_MIN,INT32_MAX,UINT32_MAX,INT64_MIN,INT64_MAX,UINT64_MAX,FLT_MAX,DBL_MAX,LDBL_MAX);
+		fflush(stdout);
 		goto nextloop;
 	}else if(!strcmp(cmd,"align")||!strcmp(cmd,"a")){
 		strtok(ibuf," \t");
