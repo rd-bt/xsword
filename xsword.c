@@ -27,20 +27,23 @@
 #define VT_ASCII 13
 #define VT_STR 14
 #define VT_ARRAY 16
-#define BUFSIZE 1024
+#define BUFSIZE 4096
 #define FBUFSIZE ((LDBL_MAX_10_EXP+128+16+15)&~15)
 #define BUFSIZE_PATH 64
 #define BUFSIZE_STDOUT (1024*1024)
-#define SIZE_ASET (1024*1024)
+#define SIZE_ASET (1024*1024*8)
 #define VBUFSIZE (sizeof(long double)>sizeof(uintmax_t)?sizeof(long double):sizeof(uintmax_t))
 #define TOCSTR(x) TOCSTR0(x)
 #define TOCSTR0(x) #x
+const char copyleft[]={
+	"License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n"
+	"This is free software: you are free to change and redistribute it.\n"};
 enum smode {SEARCH_NORMAL,SEARCH_COMPARE,SEARCH_FUZZY,SEARCH_FUZZYFIX};
 float epsilon_float=FLT_EPSILON;
 double epsilon_double=DBL_EPSILON;
 long double epsilon_ldouble=LDBL_EPSILON;
 volatile sig_atomic_t freezing=0;
-volatile sig_atomic_t nnext=1;
+volatile sig_atomic_t next_freezing=0;
 char fbuf[FBUFSIZE];
 char buf_stdout[BUFSIZE_STDOUT];
 char keywords[BUFSIZE];
@@ -942,11 +945,152 @@ int dat2spec(const char *restrict a,struct timespec *restrict spec){
 	spec->tv_nsec=n;
 return 2;
 }
+#define CMD_RECORD_MAX 16
+int recd_last=0,index_last=0;
+char cmd_last[CMD_RECORD_MAX][BUFSIZE];
+struct termios argp_backup;
+ssize_t read_input(int fd,char *buf, size_t count){
+	ssize_t r,off=0;
+	size_t len,blen=0;
+	static char sbuf[4096+16],backup[4096];
+	static char *p=sbuf,*p1;
+	int il_up=0,index;
+	char c;
+reread:
+	r=read(fd,p,1);
+	if(r<=0)return r;
+	if(*p==argp_backup.c_cc[VEOF]){
+		return 0;
+	}else if(*p==argp_backup.c_cc[VERASE]){
+		if(off<0){
+			p1=p+off-1;
+			do{
+				*p1=p1[1];
+			}while(p1++!=p-2);
+			write(STDERR_FILENO,"\b",1);
+			r=write(STDERR_FILENO,p+off-1,-off);
+			write(STDERR_FILENO," \b",2);
+			while(r--)write(STDERR_FILENO,"\b",1);
+		}
+		if(p!=sbuf){
+			if(!off)write(STDERR_FILENO,"\b \b",3);
+			--p;
+		}
+		goto reread;
+	}else if(*p==argp_backup.c_cc[VKILL]){
+		while(p!=sbuf){
+			--p;
+			write(STDERR_FILENO,"\b \b",3);
+		}
+		goto reread;
+	}
+	switch(*p){
+		case '\n':
+			len=p-sbuf+1;
+			memcpy(buf,sbuf,len);
+			p=sbuf;
+			write(STDERR_FILENO,"\n",1);
+			return len;
+		case '\033':
+			read(fd,p+1,1);
+			read(fd,p+2,1);
+			if(p[1]!='[')return 0;
+			switch(p[2]){
+				case 'A':
+				if(il_up>=recd_last)goto reread;
+				if(!il_up){
+					blen=p-sbuf;
+					if(blen)memcpy(backup,sbuf,blen);
+				}
+				while(p!=sbuf){
+					--p;
+					write(STDERR_FILENO,"\b \b",3);
+				}
+				index=index_last-il_up;
+				if(index<0)index+=CMD_RECORD_MAX;
+				len=strlen(cmd_last[index]);
+				if(len>0){
+					memcpy(sbuf,cmd_last[index],len);
+					p+=len;
+					write(STDERR_FILENO,cmd_last[index],len);			
+				}
+				++il_up;
+				goto reread;
+				case 'B':
+				while(p!=sbuf){
+					--p;
+					write(STDERR_FILENO,"\b \b",3);
+				}
+				if(il_up<1){
+					if(blen){
+						memcpy(sbuf,backup,blen);
+						p+=blen;
+						write(STDERR_FILENO,backup,blen);
+					}
+					goto reread;
+				}
+				il_up-=(il_up==recd_last)?2:1;
+				index=index_last-il_up;
+				if(index<0)index+=CMD_RECORD_MAX;
+				len=strlen(cmd_last[index]);
+				if(len>0){
+					memcpy(sbuf,cmd_last[index],len);
+					p+=len;
+					write(STDERR_FILENO,cmd_last[index],len);			
+				}
+				goto reread;
+				case 'D':
+					if(p-sbuf<=-off)goto reread;
+					--off;
+					write(STDERR_FILENO,"\b",1);
+					goto reread;
+				case 'C':
+					if(off>=0)goto reread;
+					write(STDERR_FILENO,p+off,1);
+					++off;
+					goto reread;
+				case 'H':
+redoH:
+					if(p-sbuf<=-off)goto reread;
+					--off;
+					write(STDERR_FILENO,"\b",1);
+					goto redoH;
+				case 'F':
+redoF:
+					if(off>=0)goto reread;
+					write(STDERR_FILENO,p+off,1);
+					++off;
+					goto redoF;
+
+				default:
+				return 0;
+				}
+		default:
+			c=*p;
+			if(off){
+				p1=p-1;
+				do{
+					p1[1]=*p1;
+				}while(p1--!=p+off);
+				*(p+off)=c;
+				r=write(STDERR_FILENO,p+off,1-off)-1;
+				while(r--)write(STDERR_FILENO,"\b",1);
+			}else{
+				write(STDERR_FILENO,p,1);
+			}
+			++p;
+			if(p==sbuf+4095){
+				sbuf[4095]='\n';
+				memcpy(buf,sbuf,4096);
+				p=sbuf;
+				return 4096;
+			}
+			goto reread;
+	}
+}
 void help(char *arg){
 	fprintf(stdout,
-	"License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n"
-	"This is free software: you are free to change and redistribute it.\n"
-	"List of all commands:\n\n"
+	"%sList of all commands:\n\n"
 	"Scanning commands:\n"
 	"[i|u][8|16|32|64] x   -- scan signed/unsigned value with the specified bits equal to x\n"
 	"[i|u][8|16|32|64] x ~ -- like the prev,but x is a variation\n"
@@ -1008,21 +1152,25 @@ void help(char *arg){
 	"update,u -- update recorded values\n"
 	"write,w x -- write x to hit addresses\n"
 	"\ncommands can be appended after %s <pid> ,which will automatically do at beginning\n"
-	,arg);
+	,copyleft,arg);
 	fflush(stdout);
 }
 struct timespec freezing_timer={
 	.tv_sec=0,
 	.tv_nsec=125000000
 };
+volatile sig_atomic_t fdmem=-1,fdmap=-1,ioret=-1;
 void psig(int sig){
 	switch(sig){
 		case SIGINT:
-			if(freezing||!nnext){
+			if(next_freezing){
+				next_freezing=0;
+			}else if(freezing){
 				freezing=0;
-				nnext=1;
-			}
-			else {
+			}else {
+				if(fdmem>=0)close(fdmem);
+				if(fdmap>=0)close(fdmap);
+				if(ioret>=0)ioctl(STDIN_FILENO,TCSETS,&argp_backup);
 				write(STDERR_FILENO,"\n",1);
 				_exit(EXIT_SUCCESS);
 			}
@@ -1037,11 +1185,11 @@ void psig(int sig){
 			break;
 	}
 }
-char ibuf[BUFSIZE+FBUFSIZE];
-char cmd[BUFSIZE+FBUFSIZE];
-char cmd_last[BUFSIZE+FBUFSIZE];
+
+char ibuf[BUFSIZE];
+char cmd[BUFSIZE];
 int main(int argc,char **argv){
-	int fdmem,fdmap,cmpmode,vtype=VT_U8,r0;
+	int cmpmode,vtype=VT_U8,r0,ret;
 	char autoexit=0,autostop=0;
 	void *back=NULL;
 	enum smode search_mode;
@@ -1052,28 +1200,29 @@ int main(int argc,char **argv){
 	char last_type[16];
 	struct addrset as,as1;
 	struct timespec sleepts;
-	size_t len,slen=0,n2;
+	size_t len,slen=0,nnext,n2;
 	long l,i;
 	off_t addr;
 	struct termios argp;
 	last_type[0]=0;
 	if(argc<2||!strcmp(argv[1],"--help")){
-		fdprintf_atomic(STDERR_FILENO,
-	"License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n"
-	"This is free software: you are free to change and redistribute it.\n"
-
-	"Usage: %s <pid>\n",argv[0]);
+		fdprintf_atomic(STDERR_FILENO,"%sUsage: %s <pid>\n",copyleft,argv[0]);
 		return 0;
-	}else if(argc==2)fdprintf_atomic(STDERR_FILENO,
-	"License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n"
-	"This is free software: you are free to change and redistribute it.\n"
-	"For help, type \"help\".\n"
-			);
+	}else if(argc==2)fdprintf_atomic(STDERR_FILENO,"%sFor help, type \"help\".\n",copyleft);
 	pid=(pid_t)atol(argv[1]);
 	if(pid<=0&&!(pid=getpidbycomm(argv[1]))){
 		fdprintf_atomic(STDERR_FILENO,"invaild pid %s\n",argv[1]);
 		return EXIT_FAILURE;
 	}
+	ioret=ioctl(STDIN_FILENO,TCGETS,&argp_backup);
+	if(ioret>=0){
+	memcpy(&argp,&argp_backup,sizeof(struct termios));
+	argp.c_lflag&=~(ICANON|ECHO);
+	argp.c_cc[VMIN]=1;
+	argp.c_cc[VTIME]=0;
+	ioctl(STDIN_FILENO,TCSETS,&argp);
+	}
+	memset(cmd_last,0,CMD_RECORD_MAX*BUFSIZE);
 	sprintf(pid_str,"%ld",(long)pid);
 	sprintf(buf,"/proc/%s/maps",pid_str);
 	fdmap=open(buf,O_RDONLY);
@@ -1097,12 +1246,9 @@ int main(int argc,char **argv){
 here:
 		back=NULL;
 	}
-	ioctl(STDIN_FILENO,TCGETS,&argp);
-	
-	ioctl(STDIN_FILENO,TCSETS,&argp);
 	for(;;){
 	fdprintf_atomic(STDERR_FILENO,"%s>",last_type[0]?last_type:argv[0]);
-	if(read(STDIN_FILENO,ibuf,BUFSIZE)<=0)break;
+	if(read_input(STDIN_FILENO,ibuf,BUFSIZE)<=0)break;
 gotcmd:
 	p=memchr(ibuf,'\n',BUFSIZE);
 	if(p)*p=0;
@@ -1124,22 +1270,28 @@ gotcmd:
 				goto nextloop;
 			}
 		}
-		if(cmd_last[0]){
+		if(cmd_last[index_last][0]){
+		next_freezing=1;
 next_again:
-		strcpy(ibuf,cmd_last);
+		strcpy(ibuf,cmd_last[index_last]);
 		back=&&back_to_next;
 		goto gotcmd;
 back_to_next:
 		++n2;
-		if(!nnext||nnext>1){
+		if(nnext!=1){
 			if(nnext)--nnext;
-			goto next_again;
+			if(next_freezing)goto next_again;
 		}
 		if(n2>1)fdprintf_atomic(STDERR_FILENO,"looped %zu times\n",n2);
+		next_freezing=0;
 		}
 		back=NULL;
 		goto nextloop;
-	}else strcpy(cmd_last,ibuf);
+	}else if(cmd[0]&&strcmp(cmd_last[index_last],ibuf)){
+		if(++index_last>=CMD_RECORD_MAX)index_last=0;
+		if(recd_last<CMD_RECORD_MAX)++recd_last;
+		strcpy(cmd_last[index_last],ibuf);
+	}
 	if(!strcmp(cmd,"quit")||!strcmp(cmd,"q")||!strcmp(cmd,"exit")){
 		break;
 	}else if(!strcmp(cmd,"autoexit")||!strcmp(cmd,"-e")||!strcmp(cmd,"--autoexit")){
@@ -1624,7 +1776,7 @@ back_to_freeze:
 			goto gotcmd;
 		}
 invcmd:
-		fdprintf_atomic(STDERR_FILENO,"invaild or incompleted command\n");
+		fdprintf_atomic(STDERR_FILENO,"invaild or incompleted command: %s\n",cmd);
 		goto nextloop;
 	}
 search_start:
@@ -1663,16 +1815,19 @@ err_search:
 	}
 //end:
 	aset_free(&as);
-	close(fdmem);
-	close(fdmap);
 	if(!back)fdprintf_atomic(STDERR_FILENO,"\n");
-	return EXIT_SUCCESS;
+	ret=EXIT_SUCCESS;
+	goto out;
 err3:
 	aset_free(&as);
 //err2:
-	close(fdmem);
 err1:
-	close(fdmap);
 err0:
-	return EXIT_FAILURE;
+	ret=EXIT_FAILURE;
+	goto out;
+out:
+	if(fdmem>=0)close(fdmem);
+	if(fdmap>=0)close(fdmap);
+	if(ioret>=0)ioctl(STDIN_FILENO,TCSETS,&argp_backup);
+	return ret;
 }
