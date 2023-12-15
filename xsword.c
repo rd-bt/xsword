@@ -12,6 +12,7 @@
 #include <stdarg.h>
 #include <limits.h>
 #include <dirent.h>
+#include <termios.h>
 #define VT_I8 0
 #define VT_U8 1
 #define VT_I16 2
@@ -27,6 +28,7 @@
 #define VT_STR 14
 #define VT_ARRAY 16
 #define BUFSIZE 1024
+#define FBUFSIZE ((LDBL_MAX_10_EXP+128+16+15)&~15)
 #define BUFSIZE_PATH 64
 #define BUFSIZE_STDOUT (1024*1024)
 #define SIZE_ASET (1024*1024)
@@ -39,7 +41,7 @@ double epsilon_double=DBL_EPSILON;
 long double epsilon_ldouble=LDBL_EPSILON;
 volatile sig_atomic_t freezing=0;
 volatile sig_atomic_t nnext=1;
-char fbuf[((LDBL_MAX_10_EXP+128+16+15)&~15)];
+char fbuf[FBUFSIZE];
 char buf_stdout[BUFSIZE_STDOUT];
 char keywords[BUFSIZE];
 const char space[256]={[0 ... 255]=' '};
@@ -70,7 +72,7 @@ pid_t getpidbycomm(const char *comm){
 	long l;
 	struct dirent *d1;
 	char buf[BUFSIZE];
-	int fd,ok;
+	int fd;
 	ssize_t r;
 	pid_t ret=0;
 	d=opendir("/proc");
@@ -101,7 +103,7 @@ int vfdprintf_atomic(int fd,const char *restrict format,va_list ap){
 	int r;
 	char buf[PIPE_BUF];
 	if((r=vsnprintf(buf,PIPE_BUF,format,ap))==EOF)return EOF;
-	return write(fd,buf,r);
+	return write(fd,buf,minz(r,PIPE_BUF));
 }
 int fprintf_atomic(FILE *restrict stream,const char *restrict format,...){
 	int fd,r;
@@ -188,7 +190,6 @@ void aset_list(struct addrset *restrict aset,int fdmem,int vtype,size_t len){
 	int64_t l;
 	uint64_t u;
 	int toa=0,r;
-	buf=malloc((len+15)&~15);
 		switch(vtype){
 			case VT_STR:
 			case VT_ASCII:
@@ -227,6 +228,11 @@ fnum:
 			default:
 				break;
 		}
+	buf=malloc((len+15)&~15);
+	if(!buf){
+		fdprintf_atomic(STDERR_FILENO,"failed (%s)\n",strerror(errno));
+		return;
+	}
 		freezing=1;
 	for(i=0;i<aset->n&&freezing;++i){
 		if(pread(fdmem,buf,len,aset->buf[i].addr)<=0){
@@ -285,7 +291,6 @@ endf1:
 			}
 			break;
 			default:
-errf:
 			fprintf(stdout," ???");
 			break;
 			}
@@ -303,13 +308,10 @@ errf:
 void aset_wlist(struct addrset *restrict aset,int fdmem,int vtype){
 	size_t i=0,len;
 	char *buf;
-	int64_t l;
-	uint64_t u;
-	int toa=0;
 		switch(vtype){
 			case VT_STR:
 			case VT_ASCII:
-				break;
+				return;
 			case VT_I8:
 			case VT_U8:
 				len=sizeof(int8_t);
@@ -350,7 +352,6 @@ void aset_wlist(struct addrset *restrict aset,int fdmem,int vtype){
 }
 void aset_write(struct addrset *restrict aset,int fdmem,void *val,size_t len){
 	size_t i=0;
-	char *buf;
 	while(i<aset->n){
 		pwrite(fdmem,val,len,aset->buf[i].addr);
 		++i;
@@ -692,7 +693,7 @@ size_t sizeofmap(const char *pr){
 int researchu(enum smode search_mode,const struct addrset *restrict oldas,int fdmem,const void *val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
 	size_t i=0,n=0,pct,pct_old=0;
 	char *buf=NULL;
-	int r0,r1;
+	int r0;
 	int64_t l,l1;
 	uint64_t u,u1;
 	buf=malloc((len+15)&~15);
@@ -956,7 +957,7 @@ void help(char *arg){
 	"[i|u][8|16|32|64] x!  -- scan signed/unsigned value unequal to x\n"
 	"[i|u][8|16|32|64] x!= -- scan signed/unsigned value equal to x\n"
 	"\tfor interger \"x!=\" is equivalent to \"x\" but maybe slower\n"
-	"\tfor float \"x!=\" allows error value and \"x\" not\n"
+	"\tfor float \"x!=\" allows an epsilon and \"x\" not\n"
 	"\tother compar operators(excluding \"~\") can also work for float\n"
 	"[i|u][8|16|32|64] -   -- scan signed/unsigned decreased value\n"
 	"[i|u][8|16|32|64] -=  -- scan signed/unsigned non-increased value\n"
@@ -969,6 +970,7 @@ void help(char *arg){
 	"ascii x -- scan continuous bytes equal to x\n"
 	"string x -- scan continuous bytes terminated by 0 equal to x\n"
 	"\nOther commands:\n"
+	"alen,al [x] -- show or set the ascii length\n"
 	"align,a [x] -- show or set the aligning bytes\n"
 	"autoexit,--autoexit,-e -- exit if no value hit in scanning\n"
 	"autostop,--autostop,-s -- send SIGSTOP before scanning and SIGCONT after it\n"
@@ -1032,9 +1034,9 @@ void psig(int sig){
 			break;
 	}
 }
-char ibuf[((LDBL_MAX_10_EXP+128+16+15)&~15)];
+char ibuf[BUFSIZE+FBUFSIZE];
 char cmd[BUFSIZE];
-char cmd_last[BUFSIZE];
+char cmd_last[BUFSIZE+FBUFSIZE];
 int main(int argc,char **argv){
 	int fdmem,fdmap,cmpmode,vtype=VT_U8,r0;
 	char autoexit=0,autostop=0;
@@ -1047,9 +1049,10 @@ int main(int argc,char **argv){
 	char last_type[16];
 	struct addrset as,as1;
 	struct timespec sleepts;
-	size_t len,slen,n2;
+	size_t len,slen=0,n2;
 	long l,i;
 	off_t addr;
+	struct termios argp;
 	last_type[0]=0;
 	if(argc<2||!strcmp(argv[1],"--help")){
 		fdprintf_atomic(STDERR_FILENO,
@@ -1091,6 +1094,9 @@ int main(int argc,char **argv){
 here:
 		back=NULL;
 	}
+	ioctl(STDIN_FILENO,TCGETS,&argp);
+	
+	ioctl(STDIN_FILENO,TCSETS,&argp);
 	for(;;){
 	fdprintf_atomic(STDERR_FILENO,"%s>",last_type[0]?last_type:argv[0]);
 	if(read(STDIN_FILENO,ibuf,BUFSIZE)<=0)break;
@@ -1382,6 +1388,21 @@ back_to_freeze:
 			fdprintf_atomic(STDERR_FILENO,"%zu\n",align);
 		}
 		goto nextloop;
+	}else if(!strcmp(cmd,"alen")||!strcmp(cmd,"al")){
+		strtok(ibuf," \t");
+		p=strtok(NULL," \t");
+		if(p){
+			if(atolodx(p,&l)==1&&l){
+				slen=(size_t)l;
+			}
+			else {
+				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
+			}
+		}else {
+			
+			fdprintf_atomic(STDERR_FILENO,"%zu\n",slen);
+		}
+		goto nextloop;
 	}else if(!strcmp(cmd,"efloat")){
 		strtok(ibuf," \t");
 		p=strtok(NULL," \t");
@@ -1637,7 +1658,7 @@ err_search:
 		if(autostop)kill(pid,SIGCONT);
 		goto err3;
 	}
-end:
+//end:
 	aset_free(&as);
 	close(fdmem);
 	close(fdmap);
@@ -1645,7 +1666,7 @@ end:
 	return EXIT_SUCCESS;
 err3:
 	aset_free(&as);
-err2:
+//err2:
 	close(fdmem);
 err1:
 	close(fdmap);
