@@ -372,16 +372,18 @@ int permscmp(const char *restrict s1,const char *restrict s2){
 
 ssize_t readall(int fd,void **pbuf){
 	char *buf,*p;
-	size_t bufsiz;
+	size_t bufsiz,r1;
 	ssize_t r,ret=0;
 	int i;
 	bufsiz=BUFSIZE;
 	if((buf=malloc(BUFSIZE))==NULL)return -errno;
 	memset(buf,0,BUFSIZE);
 	lseek(fd,0,SEEK_SET);
-	while((r=read(fd,buf+bufsiz-BUFSIZE,BUFSIZE))>0){
+	r1=0;
+	while((r=read(fd,buf+r1+bufsiz-BUFSIZE,BUFSIZE-r1))>0){
+		r1+=r;
 		ret+=r;
-		if(r==BUFSIZE){
+		if(ret==bufsiz){
 			bufsiz+=BUFSIZE;
 			if((p=realloc(buf,bufsiz))==NULL){
 				i=errno;
@@ -390,7 +392,8 @@ ssize_t readall(int fd,void **pbuf){
 			}
 			buf=p;
 			memset(buf+bufsiz-BUFSIZE,0,BUFSIZE);
-		}else break;
+			r1=0;
+		}
 	}
 	*pbuf=buf;
 	return ret;
@@ -792,6 +795,7 @@ int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t
 	if(sr<0){
 		return (int)-sr;
 	}
+	write(1,rbuf,sr);
 	sr=sizeofmap(rbuf);
 	pr=rbuf;
 	if(quiet)fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",0lu,as->n);
