@@ -341,13 +341,15 @@ void aset_wlist(struct addrset *restrict aset,int fdmem,int vtype){
 				return;
 		}
 	buf=malloc((len+15)&~15);
-	while(i<aset->n){
+	freezing=1;
+	while(i<aset->n&&freezing){
 		if(pread(fdmem,buf,len,aset->buf[i].addr)==len){
 			aset->valued=1;
 			memcpy(aset->buf[i].val,buf,len);
 		}
 		++i;
 	}
+	freezing=0;
 	free(buf);
 }
 void aset_write(struct addrset *restrict aset,int fdmem,void *val,size_t len){
@@ -690,14 +692,16 @@ size_t sizeofmap(const char *pr){
 	}
 	return ret;
 }
-int researchu(enum smode search_mode,const struct addrset *restrict oldas,int fdmem,const void *val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
-	size_t i=0,n=0,pct,pct_old=0;
+int researchu(enum smode search_mode,const struct addrset *restrict oldas,int fdmem,const void *restrict val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
+	ssize_t i=0,n=0,ilast,s;
 	char *buf=NULL;
 	int r0;
 	int64_t l,l1;
 	uint64_t u,u1;
 	buf=malloc((len+15)&~15);
 	if(!buf)return errno;
+	ilast=-oldas->n;
+	s=oldas->n/100+!!(oldas->n%100);
 	while(i<oldas->n&&freezing){
 		if(pread(fdmem,buf,len,oldas->buf[i].addr)==len){
 			switch(search_mode){
@@ -763,17 +767,16 @@ fuzzy_fix:
 		goto end;
 end:
 		++i;
-		pct=i*100/oldas->n;
-		if(pct>pct_old){
-		fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",pct,n);
-		pct_old=pct;
+		if((i-ilast)>=s||i==oldas->n){
+		fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",i*100/oldas->n,n);
+		ilast=i;
 		}
 	}
 	fdprintf_atomic(STDERR_FILENO,"\n");
 	free(buf);
 	return 0;
 }
-int searchu(enum smode search_mode,int fdmap,int fdmem,void *val,size_t len,struct addrset *as,int (*compar)(const void *,const void *)){
+int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
 	char *buf2,*rbuf,perms[sizeof("rwxp")],vmname[(BUFSIZE+1+15)&~15];
 	void *sa,*ea;
 	char *p,*pr;
@@ -1035,7 +1038,7 @@ void psig(int sig){
 	}
 }
 char ibuf[BUFSIZE+FBUFSIZE];
-char cmd[BUFSIZE];
+char cmd[BUFSIZE+FBUFSIZE];
 char cmd_last[BUFSIZE+FBUFSIZE];
 int main(int argc,char **argv){
 	int fdmem,fdmap,cmpmode,vtype=VT_U8,r0;
