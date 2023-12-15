@@ -795,7 +795,6 @@ int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t
 	if(sr<0){
 		return (int)-sr;
 	}
-	write(1,rbuf,sr);
 	sr=sizeofmap(rbuf);
 	pr=rbuf;
 	if(quiet)fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",0lu,as->n);
