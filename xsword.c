@@ -109,7 +109,7 @@ const char usage[]={
 "list,l,ls -- list values hit\n"
 "limit -- list limits of types\n"
 "ln -- show number of values hit\n"
-"nest,n [x|inf] -- redo the lasted command 1 or x times,or endless until SIGINT gained\n"
+"next,n [x|inf] -- redo the lasted command 1 or x times,or endless until SIGINT gained\n"
 "perms,p [x] -- show or set the perms filter used at first scanning to x\n"
 "\tx must be [r|-|*][w|-|*][x|-|*][s|p|*],r:read,w:write,x:execute,s:shared,p:private(copy-on-write),*:any,-:forbidden\n"
 "pid -- print pid of target process\n"
@@ -1039,7 +1039,7 @@ void showcmds(const char *ccmd,size_t clen,char *copy){
 	write(STDERR_FILENO,"\n",1);
 	*copy=0;
 	while((p1=strchr(p,'\n'))){
-		if((p2=memmem(p,p1-p," -- ",4))){
+		if((p2=memmem(p,p1-p,"-- ",3))){
 			p3=memchr(p,',',p2-p);
 			if(!p3)p3=memchr(p,' ',p2-p);
 			if(p3&&clen<=p3-p&&!memcmp(p,ccmd,clen)&&!memchr(p,'/',p3-p)){
@@ -1058,7 +1058,8 @@ void showcmds(const char *ccmd,size_t clen,char *copy){
 				}
 			}
 		}
-		p=p1+1;
+		while(*p1=='\n')++p1;
+		p=p1;
 	}
 	if(!r){
 		write(STDERR_FILENO,"command ",8);
@@ -1312,14 +1313,6 @@ int main(int argc,char **argv){
 		fdprintf_atomic(STDERR_FILENO,"invaild pid %s\n",argv[1]);
 		return EXIT_FAILURE;
 	}
-	ioret=ioctl(STDIN_FILENO,TCGETS,&argp_backup);
-	if(ioret>=0){
-	memcpy(&argp,&argp_backup,sizeof(struct termios));
-	argp.c_lflag&=~(ICANON|ECHO);
-	argp.c_cc[VMIN]=1;
-	argp.c_cc[VTIME]=0;
-	ioctl(STDIN_FILENO,TCSETS,&argp);
-	}
 	memset(cmd_last,0,CMD_RECORD_MAX*BUFSIZE);
 	sprintf(pid_str,"%ld",(long)pid);
 	sprintf(buf,"/proc/%s/maps",pid_str);
@@ -1343,6 +1336,14 @@ int main(int argc,char **argv){
 		goto gotcmd;
 here:
 		back=NULL;
+	}
+	ioret=ioctl(STDIN_FILENO,TCGETS,&argp_backup);
+	if(ioret>=0){
+	memcpy(&argp,&argp_backup,sizeof(struct termios));
+	argp.c_lflag&=~(ICANON|ECHO);
+	argp.c_cc[VMIN]=1;
+	argp.c_cc[VTIME]=0;
+	ioctl(STDIN_FILENO,TCSETS,&argp);
 	}
 	for(;;){
 	fdprintf_atomic(STDERR_FILENO,"%s>",last_type[0]?last_type:argv[0]);
