@@ -52,6 +52,79 @@ size_t keylen=0;
 char cperms[8]={"****"};
 size_t align=1;
 int quiet=0;
+const char usage[]={
+"List of all commands:\n\n"
+"Scanning commands:\n"
+"i8 x  -- scan signed 8-bit value equal to x\n"
+"u8 x  -- scan unsigned 8-bit value equal to x\n"
+"i16 x -- scan signed 16-bit value equal to x\n"
+"u16 x -- scan unsigned 16-bit value equal to x\n"
+"i32 x -- scan signed 32-bit value equal to x\n"
+"u32 x -- scan unsigned 32-bit value equal to x\n"
+"i64 x -- scan signed 64-bit value equal to x\n"
+"u64 x -- scan unsigned 64-bit value equal to x\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 x ~ -- like the prev,but x is a variation\n"
+"float x                           -- scan float value equal to x\n"
+"double x                          -- scan double value equal to x\n"
+"ldouble x                         -- scan long double value equal to x\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 x-  -- scan signed/unsigned value below to x\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 x-= -- scan signed/unsigned value below or equal to  x\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 x+  -- scan signed/unsigned value above to x\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 x+= -- scan signed/unsigned value above or equal to x\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 x!  -- scan signed/unsigned value unequal to x\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 x!= -- scan signed/unsigned value equal to x\n"
+"\tfor interger \"x!=\" is equivalent to \"x\" but maybe slower\n"
+"\tfor float \"x!=\" allows an epsilon and \"x\" not\n"
+"\tother compar operators(excluding \"~\") can also work for float\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 -   -- scan signed/unsigned decreased value\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 -=  -- scan signed/unsigned non-increased value\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 +   -- scan signed/unsigned increased value\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 +=  -- scan signed/unsigned non-decreased value\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 !   -- scan signed/unsigned modified value\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 !=  -- scan signed/unsigned non-modified value\n"
+"\tthese operators can also work for float\n"
+"\tthese will scan all value at first scanning,suggest using \"perms\" and \"key\" to limit the field to scan and \"align\" unless your machine is a quantum computer\n"
+"ascii x -- scan continuous bytes equal to x\n"
+"string x -- scan continuous bytes terminated by 0 equal to x\n"
+"\nOther commands:\n"
+"alen,al [x] -- show or set the ascii length\n"
+"align,a [x] -- show or set the aligning bytes\n"
+"autoexit,--autoexit,-e -- exit if no value hit in scanning\n"
+"autostop,--autostop,-s -- send SIGSTOP before scanning and SIGCONT after it\n"
+"cont,c -- send SIGCONT\n"
+"exit -- exit\n"
+"echo x -- print x\n"
+"echon x -- print x without \\n\n"
+"out x -- print x to stdout\n"
+"outn x -- print x to stdout without \\n\n"
+"efloat [x] -- show or set the epsilon value for scanning float value\n"
+"edouble [x] -- show or set the epsilon value for scanning double value\n"
+"eldouble [x] -- show or set the epsilon value for scanning long double value\n"
+"\tdefault FLT_EPSILON/DBL_EPSILON/LDBL_EPSILON\n"
+"ftimer,ft x -- use x(decimal,second) as the interval in \"freeze\",default 0.125\n"
+"freeze,f x -- write x to hit addresses looply\n"
+"help,h,usage [cmd] -- print usage of all commands or cmd if given\n"
+"key [x] -- show or set keyword to x used for first scanning,matched with vmname,separated by space\n"
+"kill,k [x] -- send signal x,default SIGKILL\n"
+"list,l,ls -- list values hit\n"
+"limit -- list limits of types\n"
+"ln -- show number of values hit\n"
+"nest,n [x|inf] -- redo the lasted command 1 or x times,or endless until SIGINT gained\n"
+"perms,p [x] -- show or set the perms filter used at first scanning to x\n"
+"\tx must be [r|-|*][w|-|*][x|-|*][s|p|*],r:read,w:write,x:execute,s:shared,p:private(copy-on-write),*:any,-:forbidden\n"
+"pid -- print pid of target process\n"
+"outpid -- print pid of target process to stdout\n"
+"quiet,--quiet,-q -- print less information at first scanning\n"
+"quit,q -- same as exit\n"
+"reset,r -- wipe values hit\n"
+"select,se x1,x2,... -- hit listed address\n"
+"sleep x -- enter the TASK_INTERRUPTIBLE state for x(decimal) seconds\n"
+"stop,s -- send SIGSTOP\n"
+"update,u -- update recorded values\n"
+"write,w x -- write x to hit addresses\n"
+"\ncommands can be appended after %s <pid> ,which will automatically do at beginning\n"
+};
+
 struct addrval {
 	off_t addr;
 	char val[VBUFSIZE];
@@ -380,7 +453,7 @@ ssize_t readall(int fd,void **pbuf){
 	memset(buf,0,BUFSIZE);
 	lseek(fd,0,SEEK_SET);
 	r1=0;
-	while((r=read(fd,buf+r1+bufsiz-BUFSIZE,BUFSIZE-r1))>0){
+	while((r=read(fd,buf+ret,BUFSIZE-r1))>0){
 		r1+=r;
 		ret+=r;
 		if(ret==bufsiz){
@@ -395,6 +468,15 @@ ssize_t readall(int fd,void **pbuf){
 			r1=0;
 		}
 	}
+	if(ret==bufsiz){
+	if((p=realloc(buf,bufsiz+1))==NULL){
+		i=errno;
+		free(buf);
+		return -i;
+	}
+	buf=p;
+	}
+	buf[ret]=0;
 	*pbuf=buf;
 	return ret;
 }
@@ -820,17 +902,18 @@ int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t
 		return r0;
 	}
 	buf2=p;
-	if((r0=pread(fdmem,buf2,size,(off_t)sa))==0)goto notfound;
+	r0=pread(fdmem,buf2,size,(off_t)sa);
 	r1=errno;
 	if(!quiet)lline+=write(STDERR_FILENO," -> ",4);
-	if(r0<0){
+	if(r0==0)goto notfound;
+	else if(r0<0){
 		if(!quiet){
 			lline+=fdprintf_atomic(STDERR_FILENO,"failed (%s)",strerror(r1));
 			goto notfound2;
 		}
 		goto notfound1;
 	}
-	switch(search_mode){
+	else switch(search_mode){
 		case SEARCH_COMPARE:
 			goto compare;
 		case SEARCH_FUZZY:
@@ -948,9 +1031,50 @@ int dat2spec(const char *restrict a,struct timespec *restrict spec){
 	spec->tv_nsec=n;
 return 2;
 }
+void showcmds(const char *ccmd,size_t clen,char *copy){
+	const char *p,*p1,*p2,*p3;
+	size_t i;
+	int r=0;
+	p=usage;
+	write(STDERR_FILENO,"\n",1);
+	*copy=0;
+	while((p1=strchr(p,'\n'))){
+		if((p2=memmem(p,p1-p," -- ",4))){
+			p3=memchr(p,',',p2-p);
+			if(!p3)p3=memchr(p,' ',p2-p);
+			if(p3&&clen<=p3-p&&!memcmp(p,ccmd,clen)&&!memchr(p,'/',p3-p)){
+				write(STDERR_FILENO,p,p3-p);
+				write(STDERR_FILENO," ",1);
+				++r;
+				if(clen){
+				if(*copy){
+				i=0;
+				while(copy[i]==p[i])++i;
+				copy[i]=0;
+				}else{
+				memcpy(copy,p,p3-p);
+				copy[p3-p]=0;
+				}
+				}
+			}
+		}
+		p=p1+1;
+	}
+	if(!r){
+		write(STDERR_FILENO,"command ",8);
+		write(STDERR_FILENO,ccmd,clen);
+		write(STDERR_FILENO," not found\n",11);
+	}
+	else write(STDERR_FILENO,"\n",1);
+}
 #define CMD_RECORD_MAX 16
 int recd_last=0,index_last=0;
 char cmd_last[CMD_RECORD_MAX][BUFSIZE];
+char ibuf[BUFSIZE];
+char cmd[BUFSIZE];
+char last_type[16];
+char input[16];
+char **args;
 struct termios argp_backup;
 ssize_t read_input(int fd,char *buf, size_t count){
 	ssize_t r,off=0;
@@ -958,10 +1082,12 @@ ssize_t read_input(int fd,char *buf, size_t count){
 	static char sbuf[4096+16],backup[4096];
 	static char *p=sbuf,*p1;
 	int il_up=0,index;
-	char c;
+	char c,last,c2=0;
 reread:
-	r=read(fd,p,1);
+	last=c2;
+	r=read(fd,&c2,1);
 	if(r<=0)return r;
+	*p=c2;
 	if(*p==argp_backup.c_cc[VEOF]){
 		return 0;
 	}else if(*p==argp_backup.c_cc[VERASE]){
@@ -994,6 +1120,20 @@ reread:
 			p=sbuf;
 			write(STDERR_FILENO,"\n",1);
 			return len;
+		case '\t':
+			if(last=='\t')goto reread;
+			index=p-sbuf+strlen(last_type[0]?last_type:args[0])+1;
+			while(index--)write(STDERR_FILENO,"\b \b",3);
+			showcmds(sbuf,p-sbuf,input);
+			fdprintf_atomic(STDERR_FILENO,"%s>",last_type[0]?last_type:args[0]);
+			index=strlen(input);
+			if(index){
+				memcpy(sbuf,input,index);
+				p=sbuf+index;
+			}
+			write(STDERR_FILENO,sbuf,p-sbuf);
+			last='\t';
+			goto reread;
 		case '\033':
 			read(fd,p+1,1);
 			read(fd,p+2,1);
@@ -1091,71 +1231,27 @@ redoF:
 			goto reread;
 	}
 }
+void helpcmd(const char *hcmd){
+	const char *p,*p1,*p2;
+	size_t len;
+	int r=0;
+	p=usage+1;
+	len=strlen(hcmd);
+	while((p=strstr(p,hcmd))){
+	if((p[-1]=='\n'||p[-1]==','||p[-1]=='/')&&(p[len]==' '||p[len]==','||p[len]=='/')&&(p1=strchr(p,'\n'))&&memmem(p,p1-p,"--",2)){
+		if(p[-1]!='\n'){
+			p2=memrchr(usage,'\n',p-usage);
+			if(p2)p=p2+1;
+		}
+		write(STDERR_FILENO,p,p1-p+1);
+		++r;
+		p=p1+1;
+	}else ++p;
+	}
+	if(!r)fdprintf_atomic(STDERR_FILENO,"command %s not found\n",hcmd);
+}
 void help(char *arg){
-	fprintf(stdout,
-	"%sList of all commands:\n\n"
-	"Scanning commands:\n"
-	"[i|u][8|16|32|64] x   -- scan signed/unsigned value with the specified bits equal to x\n"
-	"[i|u][8|16|32|64] x ~ -- like the prev,but x is a variation\n"
-	"float x               -- scan float value equal to x\n"
-	"double x              -- scan double value equal to x\n"
-	"ldouble x             -- scan long double value equal to x\n"
-	"[i|u][8|16|32|64] x-  -- scan signed/unsigned value below to x\n"
-	"[i|u][8|16|32|64] x-= -- scan signed/unsigned value below or equal to  x\n"
-	"[i|u][8|16|32|64] x+  -- scan signed/unsigned value above to x\n"
-	"[i|u][8|16|32|64] x+= -- scan signed/unsigned value above or equal to x\n"
-	"[i|u][8|16|32|64] x!  -- scan signed/unsigned value unequal to x\n"
-	"[i|u][8|16|32|64] x!= -- scan signed/unsigned value equal to x\n"
-	"\tfor interger \"x!=\" is equivalent to \"x\" but maybe slower\n"
-	"\tfor float \"x!=\" allows an epsilon and \"x\" not\n"
-	"\tother compar operators(excluding \"~\") can also work for float\n"
-	"[i|u][8|16|32|64] -   -- scan signed/unsigned decreased value\n"
-	"[i|u][8|16|32|64] -=  -- scan signed/unsigned non-increased value\n"
-	"[i|u][8|16|32|64] +   -- scan signed/unsigned increased value\n"
-	"[i|u][8|16|32|64] +=  -- scan signed/unsigned non-decreased value\n"
-	"[i|u][8|16|32|64] !   -- scan signed/unsigned modified value\n"
-	"[i|u][8|16|32|64] !=  -- scan signed/unsigned non-modified value\n"
-	"\tthese operators can also work for float\n"
-	"\tthese will scan all value at first scanning,suggest using \"perms\" and \"key\" to limit the field to scan and \"align\" unless your machine is a quantum computer\n"
-	"ascii x -- scan continuous bytes equal to x\n"
-	"string x -- scan continuous bytes terminated by 0 equal to x\n"
-	"\nOther commands:\n"
-	"alen,al [x] -- show or set the ascii length\n"
-	"align,a [x] -- show or set the aligning bytes\n"
-	"autoexit,--autoexit,-e -- exit if no value hit in scanning\n"
-	"autostop,--autostop,-s -- send SIGSTOP before scanning and SIGCONT after it\n"
-	"cont,c -- send SIGCONT\n"
-	"exit,quit,q -- exit\n"
-	"echo x -- print x\n"
-	"echon x -- print x without \\n\n"
-	"out x -- print x to stdout\n"
-	"outn x -- print x to stdout without \\n\n"
-	"efloat [x] -- show or set the epsilon value for scanning float value\n"
-	"edouble [x] -- show or set the epsilon value for scanning double value\n"
-	"eldouble [x] -- show or set the epsilon value for scanning long double value\n"
-	"\tdefault FLT_EPSILON/DBL_EPSILON/LDBL_EPSILON\n"
-	"ftimer,ft x -- use x(decimal,second) as the interval in \"freeze\",default 0.125\n"
-	"freeze,f x -- write x to hit addresses looply\n"
-	"help,h,usage -- print this help\n"
-	"key [x] -- show or set keyword to x used for first scanning,matched with vmname,separated by space\n"
-	"kill,k [x] -- send signal x,default SIGKILL\n"
-	"list,l,ls -- list values hit\n"
-	"limit -- list limits of types\n"
-	"ln -- show number of values hit\n"
-	"nest,n [x|inf] -- redo the lasted command 1 or x times,or endless until SIGINT gained\n"
-	"perms,p [x] -- show or set the perms filter used at first scanning to x\n"
-	"\tx must be [r|-|*][w|-|*][x|-|*][s|p|*],r:read,w:write,x:execute,s:shared,p:private(copy-on-write),*:any,-:forbidden\n"
-	"pid -- print pid of target process\n"
-	"outpid -- print pid of target process to stdout\n"
-	"quiet,--quiet,-q -- print less information at first scanning\n"
-	"reset,r -- wipe values hit\n"
-	"select,se x1,x2,... -- hit listed address\n"
-	"sleep x -- enter the TASK_INTERRUPTIBLE state for x(decimal) seconds\n"
-	"stop,s -- send SIGSTOP\n"
-	"update,u -- update recorded values\n"
-	"write,w x -- write x to hit addresses\n"
-	"\ncommands can be appended after %s <pid> ,which will automatically do at beginning\n"
-	,copyleft,arg);
+	fprintf(stdout,usage,arg);
 	fflush(stdout);
 }
 struct timespec freezing_timer={
@@ -1189,8 +1285,7 @@ void psig(int sig){
 	}
 }
 
-char ibuf[BUFSIZE];
-char cmd[BUFSIZE];
+
 int main(int argc,char **argv){
 	int cmpmode,vtype=VT_U8,r0,ret;
 	char autoexit=0,autostop=0;
@@ -1200,13 +1295,13 @@ int main(int argc,char **argv){
 	pid_t pid;
 	char buf[BUFSIZE_PATH];
 	char vbuf[VBUFSIZE];
-	char last_type[16];
 	struct addrset as,as1;
 	struct timespec sleepts;
 	size_t len,slen=0,nnext,n2;
 	long l,i;
 	off_t addr;
 	struct termios argp;
+	args=argv;
 	last_type[0]=0;
 	if(argc<2||!strcmp(argv[1],"--help")){
 		fdprintf_atomic(STDERR_FILENO,"%sUsage: %s <pid>\n",copyleft,argv[0]);
@@ -1310,7 +1405,11 @@ back_to_next:
 		if(!autostop)fdprintf_atomic(STDERR_FILENO,"exited autostop mode\n");
 		goto nextloop;
 	}else if(!strcmp(cmd,"help")||!strcmp(cmd,"h")||!strcmp(cmd,"usage")){
-		help(argv[0]);
+		strtok(ibuf," \t");
+		if((p=strtok(NULL," \t"))){
+			helpcmd(p);
+		}
+		else help(argv[0]);
 		goto nextloop;
 	}else if(!strcmp(cmd,"stop")||!strcmp(cmd,"s")){
 		if(kill(pid,SIGSTOP)<0)fdprintf_atomic(STDERR_FILENO,"kill failed (%s)\n",strerror(errno));
@@ -1495,8 +1594,9 @@ back_to_freeze:
 		goto from_f;
 	}else if(!strcmp(cmd,"reset")||!strcmp(cmd,"r")){
 		last_type[0]=0;
-		fdprintf_atomic(STDERR_FILENO,"wiped %zu addresses\n",as.n);
+		len=as.n;
 		aset_wipe(&as);
+		fdprintf_atomic(STDERR_FILENO,"wiped %zu addresses\n",len);
 		goto nextloop;
 	}else if(!strcmp(cmd,"perms")||!strcmp(cmd,"p")){
 		strtok(ibuf," \t");
