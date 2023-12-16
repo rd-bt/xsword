@@ -38,7 +38,7 @@
 const char copyleft[]={
 	"License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n"
 	"This is free software: you are free to change and redistribute it.\n"};
-enum smode {SEARCH_NORMAL,SEARCH_COMPARE,SEARCH_FUZZY,SEARCH_FUZZYFIX};
+enum smode {SEARCH_NORMAL,SEARCH_COMPARE,SEARCH_FUZZY,SEARCH_FUZZYFIX,SEARCH_RANGE};
 float epsilon_float=FLT_EPSILON;
 double epsilon_double=DBL_EPSILON;
 long double epsilon_ldouble=LDBL_EPSILON;
@@ -64,6 +64,7 @@ const char usage[]={
 "i64 x -- scan signed 64-bit value equal to x\n"
 "u64 x -- scan unsigned 64-bit value equal to x\n"
 "i8/u8/i16/u16/i32/u32/i64/u64 x ~ -- like the prev,but x is a variation\n"
+"i8/u8/i16/u16/i32/u32/i64/u64 x y -- scan value in [x,y]nZ,Z is all value in the given type\n"
 "float x                           -- scan float value equal to x\n"
 "double x                          -- scan double value equal to x\n"
 "ldouble x                         -- scan long double value equal to x\n"
@@ -780,12 +781,20 @@ size_t sizeofmap(const char *pr){
 	}
 	return ret;
 }
+struct range_struct{
+	uint64_t supu;
+	uint64_t infu;
+	int64_t supi;
+	int64_t infi;
+};
 int researchu(enum smode search_mode,const struct addrset *restrict oldas,int fdmem,const void *restrict val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
 	ssize_t i=0,n=0,ilast,s;
 	char *buf=NULL;
 	int r0;
 	int64_t l,l1;
 	uint64_t u,u1;
+	const struct range_struct *rs;
+	rs=(const struct range_struct *restrict)val;
 	buf=malloc((len+15)&~15);
 	if(!buf)return errno;
 	ilast=-oldas->n;
@@ -799,36 +808,19 @@ int researchu(enum smode search_mode,const struct addrset *restrict oldas,int fd
 					goto fuzzy;
 				case SEARCH_FUZZYFIX:
 					goto fuzzy_fix;
+				case SEARCH_RANGE:
+					goto range;
 				default:
 					break;
 			}
 		}else goto end;
-		if(!memcmp(buf,val,len)){
-			r0=aset_addv(as,oldas->buf[i].addr,val,len);
-			if(r0<0){
-				free(buf);
-				return -r0;
-			}
-			++n;
-		}
+		if(!memcmp(buf,val,len))goto ok;
 		goto end;
 compare:
-		if(compar(buf,val)){
-			if((r0=aset_addv(as,oldas->buf[i].addr,buf,len))<0){
-				free(buf);
-				return -r0;
-			}
-			++n;
-		}
+		if(compar(buf,val))goto ok;
 		goto end;
 fuzzy:
-		if(compar(buf,oldas->buf[i].val)){
-			if((r0=aset_addv(as,oldas->buf[i].addr,buf,len))<0){
-				free(buf);
-				return -r0;
-			}
-			++n;
-		}
+		if(compar(buf,oldas->buf[i].val))goto ok;
 		goto end;
 fuzzy_fix:
 			l=(buf[len-1]&0x80)?-1:0;
@@ -841,18 +833,29 @@ fuzzy_fix:
 			memcpy(&u1,oldas->buf[i].val,len);
 			l-=l1;
 			u-=u1;
-			l1=(((char *)val)[len-1]&0x80)?-1:0;
+			l1=(((const char *restrict)val)[len-1]&0x80)?-1:0;
 			memcpy(&l1,val,len);
 			u1=0;
 			memcpy(&u1,val,len);
-		if(u==u1||l==l1){
+		if(u==u1||l==l1)goto ok;
+		goto end;
+range:
+			if(rs->supu>=rs->infu){
+				u=0;
+				memcpy(&u,buf,len);
+				if(u>=rs->infu&&u<=rs->supu)goto ok;
+			}else if(rs->supi>=rs->infi){
+				l=(buf[len-1]&0x80)?-1:0;
+				memcpy(&l,buf,len);
+				if(l>=rs->infi&&l<=rs->supi)goto ok;
+			}
+			goto end;
+ok:
 			if((r0=aset_addv(as,oldas->buf[i].addr,buf,len))<0){
 				free(buf);
 				return -r0;
 			}
 			++n;
-		}
-		goto end;
 end:
 		++i;
 		if((i-ilast)>=s||i==oldas->n){
@@ -870,7 +873,11 @@ int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t
 	char *p,*pr;
 	size_t n,size,scanned=0,pct,lline,maxlline=0;
 	ssize_t sr;
+	uint64_t u;
+	int64_t l;
 	int r0,r1;
+	const struct range_struct *rs;
+	rs=(const struct range_struct *restrict)val;
 	if(len==0)return 0;
 	buf2=NULL;
 	sr=readall(fdmap,(void **)&rbuf);
@@ -918,6 +925,8 @@ int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t
 			goto compare;
 		case SEARCH_FUZZY:
 			goto fuzzy;
+		case SEARCH_RANGE:
+			goto range;
 		case SEARCH_FUZZYFIX:
 		default:
 			break;
@@ -929,7 +938,7 @@ int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t
 			free(rbuf);
 			return -r0;
 		}
-		if((size_t)(p-buf2)<size)
+//		if((size_t)(p-buf2)<size)
 		p+=align;
 	}
 	goto end;
@@ -953,6 +962,29 @@ fuzzy:
 			if(buf2)free(buf2);
 			free(rbuf);
 			return -r0;
+		}
+		p+=align;
+	}
+	goto end;
+range:
+	while((size_t)(p-buf2)<=size-len){
+		if(rs->supu>=rs->infu){
+			u=0;
+			memcpy(&u,p,len);
+			if(u>=rs->infu&&u<=rs->supu)goto range_ok;
+		}else if(rs->supi>=rs->infi){
+			l=(p[len-1]&0x80)?-1:0;
+			memcpy(&l,p,len);
+			if(l>=rs->infi&&l<=rs->supi)goto range_ok;
+		}
+		if(0){
+range_ok:
+		++n;
+		if((r0=aset_addv(as,(off_t)((uintptr_t)sa+(p-buf2)),p,len))<0){
+			if(buf2)free(buf2);
+			free(rbuf);
+			return -r0;
+		}
 		}
 		p+=align;
 	}
@@ -1296,12 +1328,14 @@ int main(int argc,char **argv){
 	pid_t pid;
 	char buf[BUFSIZE_PATH];
 	char vbuf[VBUFSIZE];
+	char vbuf2[VBUFSIZE];
 	struct addrset as,as1;
 	struct timespec sleepts;
 	size_t len,slen=0,nnext,n2;
 	long l,i;
 	off_t addr;
 	struct termios argp;
+	struct range_struct rs;
 	args=argv;
 	last_type[0]=0;
 	if(argc<2||!strcmp(argv[1],"--help")){
@@ -1594,7 +1628,6 @@ back_to_freeze:
 		len-=2;
 		goto from_f;
 	}else if(!strcmp(cmd,"reset")||!strcmp(cmd,"r")){
-		last_type[0]=0;
 		len=as.n;
 		aset_wipe(&as);
 		fdprintf_atomic(STDERR_FILENO,"wiped %zu addresses\n",len);
@@ -1729,17 +1762,39 @@ back_to_freeze:
 		search_mode=SEARCH_NORMAL;
 		goto search_start;
 	}else if(!strcmp(cmd,"i8")||!strcmp(cmd,"u8")){
+		len=sizeof(int8_t);
 		vtype=cmd[0]=='i'?VT_I8:VT_U8;
+int_uni:
 		strcpy(last_type,cmd);
 		strtok(ibuf," \t");
 		p1=strtok(NULL," \t");
 		search_mode=SEARCH_NORMAL;
 		if(p1){
-			len=sizeof(int8_t);
 			if(atolodxs(p1,vbuf,!(vtype&1))==1){
 				p=vbuf;
 				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
-				else if((p1=strtok(NULL," \t"))&&*p1=='~')search_mode=SEARCH_FUZZYFIX;
+				else if((p1=strtok(NULL," \t"))){
+					if(*p1=='~')search_mode=SEARCH_FUZZYFIX;
+					else if(atolodxs(p1,vbuf2,!(vtype&1))==1){
+						if(vtype&1){
+							rs.supi=0;
+							rs.infi=1;
+							rs.supu=0;
+							rs.infu=0;
+							memcpy(&rs.supu,vbuf2,len);
+							memcpy(&rs.infu,vbuf,len);
+						}else {
+							rs.supu=0;
+							rs.infu=1;
+							rs.supi=(vbuf2[len-1]&0x80)?-1:0;
+							rs.infi=(vbuf[len-1]&0x80)?-1:0;
+							memcpy(&rs.supi,vbuf2,len);
+							memcpy(&rs.infi,vbuf,len);
+						}
+						p=(char *)&rs;
+						search_mode=SEARCH_RANGE;
+					}
+				}
 			}
 			else if(getfuzzymode(p1,&cmpmode)){
 				search_mode=SEARCH_FUZZY;
@@ -1750,68 +1805,17 @@ back_to_freeze:
 		}else goto nextloop;
 		goto search_start;
 	}else if(!strcmp(cmd,"i16")||!strcmp(cmd,"u16")){
+		len=sizeof(int16_t);
 		vtype=cmd[0]=='i'?VT_I16:VT_U16;
-		strcpy(last_type,cmd);
-		strtok(ibuf," \t");
-		p1=strtok(NULL," \t");
-		search_mode=SEARCH_NORMAL;
-		if(p1){
-			len=sizeof(int16_t);
-			if(atolodxs(p1,vbuf,!(vtype&1))==1){
-				p=vbuf;
-				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
-				else if((p1=strtok(NULL," \t"))&&*p1=='~')search_mode=SEARCH_FUZZYFIX;
-			}
-			else if(getfuzzymode(p1,&cmpmode)){
-				search_mode=SEARCH_FUZZY;
-			}else {
-				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
-				goto nextloop;
-			}
-		}else goto nextloop;
-		goto search_start;
+		goto int_uni;
 	}else if(!strcmp(cmd,"i32")||!strcmp(cmd,"u32")){
+		len=sizeof(int32_t);
 		vtype=cmd[0]=='i'?VT_I32:VT_U32;
-		strcpy(last_type,cmd);
-		strtok(ibuf," \t");
-		p1=strtok(NULL," \t");
-		search_mode=SEARCH_NORMAL;
-		if(p1){
-			len=sizeof(int32_t);
-			if(atolodxs(p1,vbuf,!(vtype&1))==1){
-				p=vbuf;
-				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
-				else if((p1=strtok(NULL," \t"))&&*p1=='~')search_mode=SEARCH_FUZZYFIX;
-			}
-			else if(getfuzzymode(p1,&cmpmode)){
-				search_mode=SEARCH_FUZZY;
-			}else {
-				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
-				goto nextloop;
-			}
-		}else goto nextloop;
-		goto search_start;
+		goto int_uni;
 	}else if(!strcmp(cmd,"i64")||!strcmp(cmd,"u64")){
+		len=sizeof(int64_t);
 		vtype=cmd[0]=='i'?VT_I64:VT_U64;
-		strcpy(last_type,cmd);
-		strtok(ibuf," \t");
-		p1=strtok(NULL," \t");
-		search_mode=SEARCH_NORMAL;
-		if(p1){
-			len=sizeof(int64_t);
-			if(atolodxs(p1,vbuf,!(vtype&1))==1){
-				p=vbuf;
-				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
-				else if((p1=strtok(NULL," \t"))&&*p1=='~')search_mode=SEARCH_FUZZYFIX;
-			}
-			else if(getfuzzymode(p1,&cmpmode)){
-				search_mode=SEARCH_FUZZY;
-			}else {
-				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
-				goto nextloop;
-			}
-		}else goto nextloop;
-		goto search_start;
+		goto int_uni;
 	}else if(!strcmp(cmd,"float")){
 		vtype=VT_FLOAT;
 		strcpy(last_type,cmd);
