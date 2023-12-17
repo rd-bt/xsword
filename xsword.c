@@ -185,6 +185,8 @@ uint64_t gcd(uint64_t x,uint64_t y){
 int snum(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
 	return (int)rs->regs[8];
+#elif __x86_64__
+	return (int)rs->rax;
 #else
 #error "unknown arch\n"
 #endif
@@ -192,6 +194,8 @@ int snum(struct user_regs_struct *restrict rs){
 long sarg1(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
 	return rs->regs[0];
+#elif __x86_64__
+	return rs->rdi;
 #else
 #error "unknown arch\n"
 #endif
@@ -199,6 +203,8 @@ long sarg1(struct user_regs_struct *restrict rs){
 long sarg2(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
 	return rs->regs[1];
+#elif __x86_64__
+	return rs->rsi;
 #else
 #error "unknown arch\n"
 #endif
@@ -206,6 +212,8 @@ long sarg2(struct user_regs_struct *restrict rs){
 long sarg3(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
 	return rs->regs[2];
+#elif __x86_64__
+	return rs->rdx;
 #else
 #error "unknown arch\n"
 #endif
@@ -213,6 +221,8 @@ long sarg3(struct user_regs_struct *restrict rs){
 long sarg4(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
 	return rs->regs[3];
+#elif __x86_64__
+	return rs->r10;
 #else
 #error "unknown arch\n"
 #endif
@@ -220,6 +230,17 @@ long sarg4(struct user_regs_struct *restrict rs){
 long sarg5(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
 	return rs->regs[4];
+#elif __x86_64__
+	return rs->r8;
+#else
+#error "unknown arch\n"
+#endif
+}
+long sarg6(struct user_regs_struct *restrict rs){
+#ifdef __aarch64__
+	return rs->regs[5];
+#elif __x86_64__
+	return rs->r9;
 #else
 #error "unknown arch\n"
 #endif
@@ -335,7 +356,6 @@ redo:
 	ptrace(PTRACE_INTERRUPT,pid,NULL,NULL);
 	r1=waitpid(pid,&status,0);
 	if(r1<0&&errno!=EINTR)goto end;
-	//else if(WIFSTOPPED(status)&&!(WSTOPSIG(status)&0x80))ptrace(PTRACE_KILL,pid,NULL,NULL);
 	while(freezing){
 		ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
 		r1=waitpid(pid,&status,0);
@@ -391,7 +411,6 @@ spec_addr_got:
 		ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
 		r1=waitpid(pid,&status,0);
 		if(r1<0&&errno!=EINTR)goto end;
-	//else if(WIFSTOPPED(status)&&!(WSTOPSIG(status)&0x80))ptrace(PTRACE_KILL,pid,NULL,NULL);
 		switch(r0){
 			case SYS_clock_nanosleep:
 			case SYS_nanosleep:
