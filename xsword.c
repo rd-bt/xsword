@@ -5,6 +5,10 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <unistd.h>
+#include <sys/ptrace.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,7 +123,8 @@ const char usage[]={
 "quit,q -- same as exit\n"
 "reset,r -- wipe values hit\n"
 "select,se x1,x2,... -- hit listed address\n"
-"sleep x -- enter the TASK_INTERRUPTIBLE state for x(decimal) seconds\n"
+"sleep,sp x -- enter the TASK_INTERRUPTIBLE state for x(decimal) seconds\n"
+"speed x [y] -- modify sleeping time to y/x times and make current time increase x/y times faster,default y=1\n"
 "stop,s -- send SIGSTOP\n"
 "update,u -- update recorded values\n"
 "write,w x -- write x to hit addresses\n"
@@ -138,6 +143,301 @@ struct addrset {
 size_t minz(size_t s1,size_t s2){
 	return s1>s2?s2:s1;
 }
+int vfdprintf_atomic(int fd,const char *restrict format,va_list ap){
+	int r;
+	char buf[PIPE_BUF];
+	if((r=vsnprintf(buf,PIPE_BUF,format,ap))==EOF)return EOF;
+	return write(fd,buf,minz(r,PIPE_BUF));
+}
+int fprintf_atomic(FILE *restrict stream,const char *restrict format,...){
+	int fd,r;
+	va_list ap;
+	fd=fileno(stream);
+	if(fd<0)return fd;
+	va_start(ap,format);
+	r=vfdprintf_atomic(fd,format,ap);
+	va_end(ap);
+	return r;
+}
+int fdprintf_atomic(int fd,const char *restrict format,...){
+	int r;
+	va_list ap;
+	va_start(ap,format);
+	r=vfdprintf_atomic(fd,format,ap);
+	va_end(ap);
+	return r;
+}
+uint64_t gcd(uint64_t x,uint64_t y){
+	uint64_t r,r1;
+	r=__builtin_ctzl(x);
+	r1=__builtin_ctzl(y);
+	r=r<r1?r:r1;
+	x>>=r;
+	y>>=r;
+	r1=(x<y);
+	while(x&&y){
+		if(r1^=1)x%=y;
+		else y%=x;
+	}
+	return (x|y)<<r;
+
+}
+int snum(struct user_regs_struct *restrict rs){
+#ifdef __aarch64__
+	return (int)rs->regs[8];
+#else
+#error "unknown arch\n"
+#endif
+}
+long sarg1(struct user_regs_struct *restrict rs){
+#ifdef __aarch64__
+	return rs->regs[0];
+#else
+#error "unknown arch\n"
+#endif
+}
+long sarg2(struct user_regs_struct *restrict rs){
+#ifdef __aarch64__
+	return rs->regs[1];
+#else
+#error "unknown arch\n"
+#endif
+}
+long sarg3(struct user_regs_struct *restrict rs){
+#ifdef __aarch64__
+	return rs->regs[2];
+#else
+#error "unknown arch\n"
+#endif
+}
+long sarg4(struct user_regs_struct *restrict rs){
+#ifdef __aarch64__
+	return rs->regs[3];
+#else
+#error "unknown arch\n"
+#endif
+}
+long sarg5(struct user_regs_struct *restrict rs){
+#ifdef __aarch64__
+	return rs->regs[4];
+#else
+#error "unknown arch\n"
+#endif
+}
+void tsadd(struct timespec *restrict d,const struct timespec *restrict s){
+	if(d->tv_nsec>=1000000000||s->tv_nsec>=1000000000)return;
+	d->tv_sec+=s->tv_sec;
+	d->tv_nsec+=s->tv_nsec;
+	if(d->tv_nsec>=1000000000){
+		++d->tv_sec;
+		d->tv_nsec-=1000000000;
+		
+	}
+}
+void tssub(struct timespec *restrict d,const struct timespec *restrict s){
+	if(d->tv_nsec>=1000000000||s->tv_nsec>=1000000000)return;
+	if(d->tv_sec<s->tv_sec){
+		d->tv_sec=0;
+		d->tv_nsec=0;
+		return;
+	}
+	d->tv_sec-=s->tv_sec;
+	if(d->tv_sec==0){
+		if(d->tv_nsec<=s->tv_nsec){
+			d->tv_nsec=0;
+		}else {
+			d->tv_nsec-=s->tv_nsec;
+		}
+		return;
+	}
+	if(d->tv_nsec<s->tv_nsec){
+		d->tv_nsec+=1000000000;
+		--d->tv_sec;
+	}
+	d->tv_nsec-=s->tv_nsec;
+	return;
+}
+void tsmul(struct timespec *restrict d,uint64_t factor){
+	if(d->tv_nsec>=1000000000||d->tv_nsec>=1000000000||factor==1)return;
+	d->tv_nsec*=factor;
+	d->tv_sec*=factor;
+	d->tv_sec+=d->tv_nsec/1000000000;
+	d->tv_nsec%=1000000000;
+}
+void tsdiv(struct timespec *restrict d,uint64_t frac){
+	if(d->tv_nsec>=1000000000||d->tv_nsec>=1000000000||frac==1)return;
+	d->tv_nsec+=d->tv_sec*1000000000;
+	d->tv_nsec/=frac;
+	d->tv_sec=d->tv_nsec/1000000000;
+	d->tv_nsec%=1000000000;
+}
+void tvadd(struct timeval *restrict d,const struct timeval *restrict s){
+	if(d->tv_usec>=1000000||s->tv_usec>=1000000)return;
+	d->tv_sec+=s->tv_sec;
+	d->tv_usec+=s->tv_usec;
+	if(d->tv_usec>=1000000){
+		++d->tv_sec;
+		d->tv_usec-=1000000;
+		
+	}
+}
+void tvsub(struct timeval *restrict d,const struct timeval *restrict s){
+	if(d->tv_usec>=1000000||s->tv_usec>=1000000)return;
+	if(d->tv_sec<s->tv_sec){
+		d->tv_sec=0;
+		d->tv_usec=0;
+		return;
+	}
+	d->tv_sec-=s->tv_sec;
+	if(d->tv_sec==0){
+		if(d->tv_usec<=s->tv_usec){
+			d->tv_usec=0;
+		}else {
+			d->tv_usec-=s->tv_usec;
+		}
+		return;
+	}
+	if(d->tv_usec<s->tv_usec){
+		d->tv_usec+=1000000;
+		--d->tv_sec;
+	}
+	d->tv_usec-=s->tv_usec;
+	return;
+}
+void tvmul(struct timeval *restrict d,uint64_t factor){
+	if(d->tv_usec>=1000000||d->tv_usec>=1000000||factor==1)return;
+	d->tv_usec*=factor;
+	d->tv_sec*=factor;
+	d->tv_sec+=d->tv_usec/1000000;
+	d->tv_usec%=1000000;
+}
+void tvdiv(struct timeval *restrict d,uint64_t frac){
+	if(d->tv_usec>=1000000||d->tv_usec>=1000000||frac==1)return;
+	d->tv_usec+=d->tv_sec*1000000;
+	d->tv_usec/=frac;
+	d->tv_sec=d->tv_usec/1000000;
+	d->tv_usec%=1000000;
+}
+void speed(int fdmem,pid_t pid,uint64_t factor,uint64_t frac){
+	struct user_regs_struct rs;
+	struct iovec iv;
+	struct timespec ts,ts2,cts_first,cts;
+	struct timeval tv_first,tv;
+	long addr;
+	int status,r1,r0,tv_inited=0,cts_inited=0,timeout,timeout2;
+	iv.iov_base=&rs;
+	iv.iov_len=sizeof rs;
+redo:
+	if(ptrace(PTRACE_SEIZE,pid,NULL,PTRACE_O_TRACESYSGOOD)<0){
+		fdprintf_atomic(STDERR_FILENO,"cannon speed %ld (%s)\n",(long)pid,strerror(errno));
+		return;
+	}
+	ptrace(PTRACE_INTERRUPT,pid,NULL,NULL);
+	r1=waitpid(pid,&status,0);
+	if(r1<0&&errno!=EINTR)goto end;
+	//else if(WIFSTOPPED(status)&&!(WSTOPSIG(status)&0x80))ptrace(PTRACE_KILL,pid,NULL,NULL);
+	while(freezing){
+		ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
+		r1=waitpid(pid,&status,0);
+		if(r1<0&&errno!=EINTR)goto end;
+	else if(WIFSTOPPED(status)&&!(WSTOPSIG(status)&0x80)){
+killed:
+		ptrace(PTRACE_DETACH,pid,NULL,NULL);
+		kill(pid,WSTOPSIG(status));
+		goto redo;
+		}
+		if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto killed;
+		r0=snum(&rs);
+		switch(r0){
+			case SYS_nanosleep:
+				addr=sarg1(&rs);
+			case SYS_clock_nanosleep:
+				addr=sarg3(&rs);
+				goto spec_addr_got;
+			case SYS_pselect6:
+				addr=sarg5(&rs);
+				goto spec_addr_got;
+			case SYS_ppoll:
+				addr=sarg3(&rs);
+				goto spec_addr_got;
+spec_addr_got:
+				if(!addr||pread(fdmem,&ts,sizeof ts,addr)<0)break;
+				memcpy(&ts2,&ts,sizeof ts);
+				if(factor){
+					tsmul(&ts,frac);
+					tsdiv(&ts,factor);
+				}else{
+					ts.tv_sec=0;
+					ts.tv_nsec=0;
+				}
+				pwrite(fdmem,&ts,sizeof ts,addr);
+				break;
+			case SYS_epoll_pwait:
+				addr=sarg4(&rs);
+				if(!addr||pread(fdmem,&timeout,sizeof timeout,addr)<0)break;
+				timeout2=timeout;
+				if(timeout==-1)break;
+				if(factor){
+					timeout*=frac;
+					timeout/=factor;
+				}else{
+					timeout=0;
+				}
+				pwrite(fdmem,&timeout,sizeof timeout,addr);
+				break;
+			default:
+				break;
+		}
+		ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
+		r1=waitpid(pid,&status,0);
+		if(r1<0&&errno!=EINTR)goto end;
+	//else if(WIFSTOPPED(status)&&!(WSTOPSIG(status)&0x80))ptrace(PTRACE_KILL,pid,NULL,NULL);
+		switch(r0){
+			case SYS_clock_nanosleep:
+			case SYS_nanosleep:
+			case SYS_pselect6:
+			case SYS_ppoll:
+				if(addr)pwrite(fdmem,&ts2,sizeof ts,addr);
+				break;
+			case SYS_epoll_pwait:
+				if(addr)pwrite(fdmem,&timeout2,sizeof timeout,addr);
+				break;
+			case SYS_gettimeofday:
+				addr=sarg1(&rs);
+				if(tv_inited){
+					if(pread(fdmem,&tv,sizeof tv,addr)<0)break;
+					tvsub(&tv,&tv_first);
+					tvmul(&tv,factor);
+					tvdiv(&tv,frac);
+					tvadd(&tv,&tv_first);
+					pwrite(fdmem,&tv,sizeof tv,addr);
+				}else {
+					if(pread(fdmem,&tv_first,sizeof tv,addr)>0)
+					tv_inited=1;
+				}
+				break;
+			case SYS_clock_gettime:
+				addr=sarg2(&rs);
+				if(cts_inited){
+					if(pread(fdmem,&cts,sizeof cts,addr)<0)break;
+					tssub(&cts,&cts_first);
+					tsmul(&cts,factor);
+					tsdiv(&cts,frac);
+					tsadd(&cts,&cts_first);
+					pwrite(fdmem,&cts,sizeof cts,addr);
+				}else {
+					if(pread(fdmem,&cts_first,sizeof cts,addr)>0)
+					cts_inited=1;
+				}
+				break;
+			default:
+				break;
+		}
+	}
+end:
+	ptrace(PTRACE_DETACH,pid,NULL,NULL);
+}
+
 const char *bfname(const char *path){
 	const char *p;
 	if(path[0]=='/'&&path[1]=='\0')return path;
@@ -176,30 +476,7 @@ pid_t getpidbycomm(const char *comm){
 	closedir(d);
 	return ret;
 }
-int vfdprintf_atomic(int fd,const char *restrict format,va_list ap){
-	int r;
-	char buf[PIPE_BUF];
-	if((r=vsnprintf(buf,PIPE_BUF,format,ap))==EOF)return EOF;
-	return write(fd,buf,minz(r,PIPE_BUF));
-}
-int fprintf_atomic(FILE *restrict stream,const char *restrict format,...){
-	int fd,r;
-	va_list ap;
-	fd=fileno(stream);
-	if(fd<0)return fd;
-	va_start(ap,format);
-	r=vfdprintf_atomic(fd,format,ap);
-	va_end(ap);
-	return r;
-}
-int fdprintf_atomic(int fd,const char *restrict format,...){
-	int r;
-	va_list ap;
-	va_start(ap,format);
-	r=vfdprintf_atomic(fd,format,ap);
-	va_end(ap);
-	return r;
-}
+
 void *memmem_aligned(const void *haystack, size_t haystacklen,const void *needle, size_t needlelen,size_t alignment){
 	const char *hay;
 	switch(alignment){
@@ -1333,13 +1610,17 @@ int main(int argc,char **argv){
 	struct timespec sleepts;
 	size_t len,slen=0,nnext,n2;
 	long l,i;
+	uint64_t u,u2;
 	off_t addr;
 	struct termios argp;
 	struct range_struct rs;
 	args=argv;
 	last_type[0]=0;
-	if(argc<2||!strcmp(argv[1],"--help")){
+	if(argc<2){
 		fdprintf_atomic(STDERR_FILENO,"%sUsage: %s <pid>\n",copyleft,argv[0]);
+		return 0;
+	}else if(!strcmp(argv[1],"--help")){
+		help(argv[0]);
 		return 0;
 	}else if(argc==2)fdprintf_atomic(STDERR_FILENO,"%sFor help, type \"help\".\n",copyleft);
 	pid=(pid_t)atol(argv[1]);
@@ -1678,6 +1959,30 @@ back_to_freeze:
 		}else {
 			
 			fdprintf_atomic(STDERR_FILENO,"%zu\n",align);
+		}
+		goto nextloop;
+	}else if(!strcmp(cmd,"speed")||!strcmp(cmd,"sp")){
+		strtok(ibuf," \t");
+		p=strtok(NULL," \t");
+		if(p){
+			if(atolodx(p,&l)==1){
+				if((p=strtok(NULL," \t"))){
+					if(atolodx(p,&u)<1||!u)goto invvalp;
+				}else u=1;
+				u2=gcd(u,l);
+				l/=u2;
+				u/=u2;
+				freezing=1;
+				speed(fdmem,pid,l,u);
+				freezing=0;
+			}
+			else {
+invvalp:
+				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
+			}
+		}else {
+			
+			fdprintf_atomic(STDERR_FILENO,"no factor given\n");
 		}
 		goto nextloop;
 	}else if(!strcmp(cmd,"alen")||!strcmp(cmd,"al")){
