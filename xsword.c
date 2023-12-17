@@ -351,6 +351,7 @@ killed:
 		switch(r0){
 			case SYS_nanosleep:
 				addr=sarg1(&rs);
+				goto spec_addr_got;
 			case SYS_clock_nanosleep:
 				addr=sarg3(&rs);
 				goto spec_addr_got;
@@ -359,7 +360,6 @@ killed:
 				goto spec_addr_got;
 			case SYS_ppoll:
 				addr=sarg3(&rs);
-				goto spec_addr_got;
 spec_addr_got:
 				if(!addr||pread(fdmem,&ts,sizeof ts,addr)<0)break;
 				memcpy(&ts2,&ts,sizeof ts);
