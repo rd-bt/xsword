@@ -32,7 +32,7 @@
 #define VT_ASCII 13
 #define VT_STR 14
 #define VT_ARRAY 16
-#define BUFSIZE 4096
+#define BUFSIZE ((size_t)4096)
 #define FBUFSIZE ((LDBL_MAX_10_EXP+128+16+15)&~15)
 #define BUFSIZE_PATH 64
 #define BUFSIZE_STDOUT (1024*1024)
@@ -145,7 +145,7 @@ struct addrset {
 typedef struct map {
 	uintptr_t start,end;
 	char perms[8];
-	char vmname[(BUFSIZE+16)&~15];
+	char vmname[BUFSIZE];
 	char *off;
 	char *tok;
 	char data[];
@@ -161,8 +161,10 @@ MAP *map_open(const char *mbuf){
 	return ret;
 }
 MAP *map_next(MAP *mp){
+	char format[64];
 	if(!mp->off)return NULL;
-	if(sscanf(mp->off,"%lx-%lx %s %*s %*s %*s %" TOCSTR(BUFSIZE) "[^\n]",&mp->start,&mp->end,mp->perms,mp->vmname)<4)mp->vmname[0]=0;
+	sprintf(format,"%%lx-%%lx %%4s %%*s %%*s %%*s %%%zu[^\n]",BUFSIZE-1);
+	if(sscanf(mp->off,format,&mp->start,&mp->end,mp->perms,mp->vmname)<4)mp->vmname[0]=0;
 	mp->off=strtok_r(NULL,"\n",&mp->tok);
 	return mp;
 }
@@ -596,7 +598,6 @@ void aset_list(struct addrset *restrict aset,int fdmem,int vtype,size_t len){
 	if(vtype&VT_ARRAY){
 		array=1;
 		vtype&=~VT_ARRAY;
-		ilen=len;
 	}
 		switch(vtype){
 			case VT_STR:
@@ -619,6 +620,7 @@ void aset_list(struct addrset *restrict aset,int fdmem,int vtype,size_t len){
 				len=sizeof(int64_t);
 				goto num;
 num:
+				if(!array)olen=len;
 				toa=1;
 				break;
 			case VT_FLOAT:
@@ -631,13 +633,14 @@ num:
 				len=sizeof(long double);
 				goto fnum;
 fnum:
+				if(!array)olen=len;
 				toa=2;
 				break;
 			default:
 				break;
 		}
-	buf=malloc(((array?ilen:len)+15)&~15);
-	if(array)ilen/=len;
+	if(array)ilen=olen/len;
+	buf=malloc((olen+15)&~15);
 	if(!buf){
 		fdprintf_atomic(STDERR_FILENO,"failed (%s)\n",strerror(errno));
 		return;
@@ -2145,6 +2148,7 @@ invvalp:
 		vtype=VT_ARRAY;
 		strtok(ibuf," \t");
 		if(!(p1=strtok(NULL," \t")))goto invcmd;
+		sprintf(last_type,"%s %s",cmd,p1);
 arr:
 		if(!strcmp(p1,"i8")){vtype|=VT_I8;len=sizeof(int8_t);}
 		else if(!strcmp(p1,"u8")){vtype|=VT_U8;len=sizeof(int8_t);}
@@ -2161,7 +2165,6 @@ arr:
 			fdprintf_atomic(STDERR_FILENO,"invaild type %s\n",p);
 			goto nextloop;
 		}
-		sprintf(last_type,"%s %s",cmd,p1);
 		if(!(p1=strtok(NULL," \t{},"))){
 			goto nextloop;
 		}
