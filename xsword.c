@@ -1196,8 +1196,8 @@ end:
 	return 0;
 }
 int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
-	char *buf2,*rbuf;
-	MAP *mp;
+	char *buf2=NULL,*rbuf=NULL;
+	MAP *mp=NULL;
 	char *p;
 	size_t n,size,scanned=0,pct,lline,maxlline=0;
 	ssize_t sr;
@@ -1210,17 +1210,18 @@ int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t
 	buf2=NULL;
 	sr=readall(fdmap,(void **)&rbuf);
 	if(sr<0){
-		return (int)-sr;
+		r0=(int)-sr;
+		goto err;
 	}
 	sr=sizeofmap(rbuf);
 	if(sr<0){
-		free(rbuf);
-		return -errno;
+		r0=errno;
+		goto err;
 	}
 	mp=map_open(rbuf);
 	if(!mp){
-		free(rbuf);
-		return -errno;
+		r0=errno;
+		goto err;
 	}
 	if(quiet)fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",0lu,as->n);
 	while(map_next(mp)&&freezing){
@@ -1273,6 +1274,7 @@ compare:
 		if(compar(p,val)){
 		++n;
 		if((r0=aset_addv(as,(off_t)(mp->start+(p-buf2)),p,len))<0){
+			r0=-r0;
 			goto err;
 		}
 		}
@@ -1283,6 +1285,7 @@ fuzzy:
 	while((size_t)(p-buf2)<=size-len){
 		++n;
 		if((r0=aset_addv(as,(off_t)(mp->start+(p-buf2)),p,len))<0){
+			r0=-r0;
 			goto err;
 		}
 		p+=align;
@@ -1303,6 +1306,7 @@ range:
 range_ok:
 		++n;
 		if((r0=aset_addv(as,(off_t)(mp->start+(p-buf2)),p,len))<0){
+			r0=-r0;
 			goto err;
 		}
 		}
@@ -1326,15 +1330,13 @@ notfound2:
 notfound1:
 	continue;
 	}
-	if(buf2)free(buf2);
-	free(rbuf);
-	if(quiet)fdprintf_atomic(STDERR_FILENO,"\n");
-	return 0;
+	r0=0;
 err:
+	if(quiet)write(STDERR_FILENO,"\n",1);
 	if(buf2)free(buf2);
-	free(rbuf);
-	free(mp);
-	return -r0;
+	if(rbuf)free(rbuf);
+	if(mp)free(mp);
+	return r0;
 }
 int atolodx(const char *restrict s,void *dst){
 	char *format="%lu";
