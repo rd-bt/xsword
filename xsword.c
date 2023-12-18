@@ -142,6 +142,30 @@ struct addrset {
 	size_t size,n;
 	int valued;
 };
+typedef struct map {
+	uintptr_t start,end;
+	char perms[8];
+	char vmname[(BUFSIZE+16)&~15];
+	char *off;
+	char *tok;
+	char data[];
+} MAP;
+MAP *map_open(const char *mbuf){
+	MAP *ret;
+	size_t msize;
+	msize=strlen(mbuf)+1;
+	ret=(MAP *)malloc(sizeof(MAP)+msize);
+	if(!ret)return NULL;
+	memcpy(ret->data,mbuf,msize);
+	ret->off=strtok_r(ret->data,"\n",&ret->tok);
+	return ret;
+}
+MAP *map_next(MAP *mp){
+	if(!mp->off)return NULL;
+	if(sscanf(mp->off,"%lx-%lx %s %*s %*s %*s %" TOCSTR(BUFSIZE) "[^\n]",&mp->start,&mp->end,mp->perms,mp->vmname)<4)mp->vmname[0]=0;
+	mp->off=strtok_r(NULL,"\n",&mp->tok);
+	return mp;
+}
 size_t minz(size_t s1,size_t s2){
 	return s1>s2?s2:s1;
 }
@@ -1073,28 +1097,16 @@ int findkeyword(const char *vn){
 	}while((p=strtok(NULL," ")));
 	return 0;
 }
-size_t sizeofmap(const char *pr){
-	int r;
-	const char *p;
-	char perms[sizeof("rwxp")],vmname[(BUFSIZE+1+15)&~15],buf[(BUFSIZE+1+15)&~15];
-	void *sa,*ea;
+ssize_t sizeofmap(const char *pr){
 	size_t ret=0;
-
-	while(*pr){
-	p=strchr(pr,'\n');
-	if(!p)return ret;
-	memcpy(buf,pr,p-pr);
-	buf[p-pr]=0;
-	if((r=sscanf(buf,"%lx-%lx %s %*s %*s %*s %" TOCSTR(BUFSIZE) "[^\n]",(unsigned long *)&sa,(unsigned long *)&ea,perms,vmname))<3){
-		pr=p+1;
-		continue;
+	MAP *mp;
+	mp=map_open(pr);
+	if(!mp)return -1;
+	while(map_next(mp)){
+		if(permscmp(mp->perms,cperms)||!findkeyword(mp->vmname))continue;
+		ret+=mp->end-mp->start;
 	}
-	if(r<4)vmname[0]=0;
-	pr=p+1;
-	if(permscmp(perms,cperms)||!findkeyword(vmname))continue;
-	ret+=(size_t)ea-(size_t)sa;
-	continue;
-	}
+	free(mp);
 	return ret;
 }
 struct range_struct{
@@ -1184,9 +1196,9 @@ end:
 	return 0;
 }
 int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
-	char *buf2,*rbuf,perms[sizeof("rwxp")],vmname[(BUFSIZE+1+15)&~15];
-	void *sa,*ea;
-	char *p,*pr;
+	char *buf2,*rbuf;
+	MAP *mp;
+	char *p;
 	size_t n,size,scanned=0,pct,lline,maxlline=0;
 	ssize_t sr;
 	uint64_t u;
@@ -1201,31 +1213,31 @@ int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t
 		return (int)-sr;
 	}
 	sr=sizeofmap(rbuf);
-	pr=rbuf;
-	if(quiet)fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",0lu,as->n);
-	while(*pr&&freezing){
-	n=0;
-	p=strchr(pr,'\n');
-	if(p){
-		*p=0;
+	if(sr<0){
+		free(rbuf);
+		return -errno;
 	}
-	if(sscanf(pr,"%lx-%lx %s %*s %*s %*s %" TOCSTR(BUFSIZE) "[^\n]",(unsigned long *)&sa,(unsigned long *)&ea,perms,vmname)<4)vmname[0]=0;
-	pr+=strlen(pr)+1;
-	if(permscmp(perms,cperms)||!findkeyword(vmname))goto notfound1;
-	size=(size_t)ea-(size_t)sa;
+	mp=map_open(rbuf);
+	if(!mp){
+		free(rbuf);
+		return -errno;
+	}
+	if(quiet)fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",0lu,as->n);
+	while(map_next(mp)&&freezing){
+	n=0;
+	if(permscmp(mp->perms,cperms)||!findkeyword(mp->vmname))goto notfound1;
+	size=mp->end-mp->start;
 	scanned+=size;
 	pct=scanned*100/sr;
 	lline=0;
-	if(!quiet)lline+=fdprintf_atomic(STDERR_FILENO,"[%3zu%%] %lx-%lx %s",pct,(uintptr_t)sa,(uintptr_t)ea,perms);
+	if(!quiet)lline+=fdprintf_atomic(STDERR_FILENO,"[%3zu%%] %lx-%lx %s",pct,mp->start,mp->end,mp->perms);
 	p=realloc(buf2,size);
 	if(!p){
 		r0=errno;
-		if(buf2)free(buf2);
-		free(rbuf);
-		return r0;
+		goto err;
 	}
 	buf2=p;
-	r0=pread(fdmem,buf2,size,(off_t)sa);
+	r0=pread(fdmem,buf2,size,mp->start);
 	r1=errno;
 	if(!quiet)lline+=write(STDERR_FILENO," -> ",4);
 	if(r0==0)goto notfound;
@@ -1249,10 +1261,8 @@ int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t
 	}
 	while((p=memmem_aligned(p,size-(size_t)(p-buf2),val,len,align))){
 		++n;
-		if((r0=aset_addv(as,(off_t)((uintptr_t)sa+(p-buf2)),val,len))<0){
-			if(buf2)free(buf2);
-			free(rbuf);
-			return -r0;
+		if((r0=aset_addv(as,(off_t)(mp->start+(p-buf2)),val,len))<0){
+			goto err;
 		}
 //		if((size_t)(p-buf2)<size)
 		p+=align;
@@ -1262,10 +1272,8 @@ compare:
 	while((size_t)(p-buf2)<=size-len){
 		if(compar(p,val)){
 		++n;
-		if((r0=aset_addv(as,(off_t)((uintptr_t)sa+(p-buf2)),p,len))<0){
-			if(buf2)free(buf2);
-			free(rbuf);
-			return -r0;
+		if((r0=aset_addv(as,(off_t)(mp->start+(p-buf2)),p,len))<0){
+			goto err;
 		}
 		}
 		p+=align;
@@ -1274,10 +1282,8 @@ compare:
 fuzzy:
 	while((size_t)(p-buf2)<=size-len){
 		++n;
-		if((r0=aset_addv(as,(off_t)((uintptr_t)sa+(p-buf2)),p,len))<0){
-			if(buf2)free(buf2);
-			free(rbuf);
-			return -r0;
+		if((r0=aset_addv(as,(off_t)(mp->start+(p-buf2)),p,len))<0){
+			goto err;
 		}
 		p+=align;
 	}
@@ -1296,10 +1302,8 @@ range:
 		if(0){
 range_ok:
 		++n;
-		if((r0=aset_addv(as,(off_t)((uintptr_t)sa+(p-buf2)),p,len))<0){
-			if(buf2)free(buf2);
-			free(rbuf);
-			return -r0;
+		if((r0=aset_addv(as,(off_t)(mp->start+(p-buf2)),p,len))<0){
+			goto err;
 		}
 		}
 		p+=align;
@@ -1310,10 +1314,10 @@ notfound:
 	if(!quiet){
 		lline+=fdprintf_atomic(STDERR_FILENO,"%zu / %zu",n,as->n);
 notfound2:
-		if(vmname[0]){
+		if(mp->vmname[0]){
 		if(lline>=maxlline)maxlline=lline;
 		else write(STDERR_FILENO,space,minz(maxlline-lline,sizeof(space)));
-		fdprintf_atomic(STDERR_FILENO,"\t(%s)",vmname);
+		fdprintf_atomic(STDERR_FILENO,"\t(%s)",mp->vmname);
 		}
 		write(STDERR_FILENO,"\n",1);
 	}
@@ -1326,6 +1330,11 @@ notfound1:
 	free(rbuf);
 	if(quiet)fdprintf_atomic(STDERR_FILENO,"\n");
 	return 0;
+err:
+	if(buf2)free(buf2);
+	free(rbuf);
+	free(mp);
+	return -r0;
 }
 int atolodx(const char *restrict s,void *dst){
 	char *format="%lu";
