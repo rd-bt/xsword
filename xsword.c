@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <complex.h>
 #include <stdarg.h>
 #include <limits.h>
 #include <dirent.h>
@@ -78,6 +79,7 @@ const char usage[]={
 "i8/u8/i16/u16/i32/u32/i64/u64 x+= -- scan signed/unsigned value above or equal to x\n"
 "i8/u8/i16/u16/i32/u32/i64/u64 x!  -- scan signed/unsigned value unequal to x\n"
 "i8/u8/i16/u16/i32/u32/i64/u64 x!= -- scan signed/unsigned value equal to x\n"
+"array,[] i8/u8/i16/u16/i32/u32/i64/u64/float/double/ldouble {x1,x2,...}  -- scan array\n"
 "\tfor interger \"x!=\" is equivalent to \"x\" but maybe slower\n"
 "\tfor float \"x!=\" allows an epsilon and \"x\" not\n"
 "\tother compar operators(excluding \"~\") can also work for float\n"
@@ -142,6 +144,9 @@ struct addrset {
 };
 size_t minz(size_t s1,size_t s2){
 	return s1>s2?s2:s1;
+}
+size_t maxz(size_t s1,size_t s2){
+	return s1>s2?s1:s2;
 }
 int vfdprintf_atomic(int fd,const char *restrict format,va_list ap){
 	int r;
@@ -558,11 +563,17 @@ void aset_wipe(struct addrset *restrict aset){
 	aset_init(aset);
 }
 void aset_list(struct addrset *restrict aset,int fdmem,int vtype,size_t len){
-	size_t i;
-	char *buf;
+	size_t i,i2,ilen,olen;
+	char *buf,*obuf;
 	int64_t l;
 	uint64_t u;
-	int toa=0,r;
+	int toa=0,r,array=0;
+	olen=len;
+	if(vtype&VT_ARRAY){
+		array=1;
+		vtype&=~VT_ARRAY;
+		ilen=len;
+	}
 		switch(vtype){
 			case VT_STR:
 			case VT_ASCII:
@@ -601,18 +612,22 @@ fnum:
 			default:
 				break;
 		}
-	buf=malloc((len+15)&~15);
+	buf=malloc(((array?ilen:len)+15)&~15);
+	if(array)ilen/=len;
 	if(!buf){
 		fdprintf_atomic(STDERR_FILENO,"failed (%s)\n",strerror(errno));
 		return;
 	}
 		freezing=1;
 	for(i=0;i<aset->n&&freezing;++i){
-		if(pread(fdmem,buf,len,aset->buf[i].addr)<=0){
+		if(pread(fdmem,buf,olen,aset->buf[i].addr)<=0){
 			fprintf(stdout,"%lx ???\n",aset->buf[i].addr);
 			continue;
 		}
-		fprintf(stdout,"%lx :",aset->buf[i].addr);
+		fprintf(stdout,"%lx :%s",aset->buf[i].addr,array?"{\n":"");
+		obuf=buf;
+		i2=0;
+		do{
 		switch(toa){
 			case 1:
 			l=(buf[len-1]&0x80)?-1:0;
@@ -620,7 +635,7 @@ fnum:
 			u=0;
 			memcpy(&u,buf,len);
 			fprintf(stdout," %ld\t%luu\t0%lo\t0x%lx",l,u,u,u);
-			if(aset->valued&&memcmp(aset->buf[i].val,buf,len)){
+			if(aset->valued&&!array&&memcmp(aset->buf[i].val,buf,len)){
 				l=(aset->buf[i].val[len-1]&0x80)?-1:0;
 				memcpy(&l,aset->buf[i].val,len);
 				u=0;
@@ -643,7 +658,7 @@ endf:
 			fbuf[r]='0';
 			while(fbuf[--r]=='0');
 			fwrite(fbuf,1,r+2,stdout);
-			if(aset->valued&&memcmp(aset->buf[i].val,buf,len))
+			if(aset->valued&&!array&&memcmp(aset->buf[i].val,buf,len))
 				switch(vtype){
 					case VT_FLOAT:
 					r=sprintf(fbuf," %.128f",*(float *)aset->buf[i].val);
@@ -672,7 +687,12 @@ endf1:
 				fwrite(buf,1,len,stdout);
 				break;
 		}
+		buf+=len;
+		++i2;
 		fputc('\n',stdout);
+	}while(array&&i2<ilen);
+		buf=obuf;
+		if(array)fwrite("}\n",1,2,stdout);
 	}
 	fflush(stdout);
 	freezing=0;
@@ -1332,6 +1352,15 @@ int atolodxs(const char *restrict s,void *dst,int sign){
 	}
 	return sscanf(s,format,dst);
 }
+int scanflt(const char *restrict s,void *dst){
+	return sscanf(s,"%f",(float *)dst);
+}
+int scandbl(const char *restrict s,void *dst){
+	return sscanf(s,"%lf",(double *)dst);
+}
+int scanldbl(const char *restrict s,void *dst){
+	return sscanf(s,"%Lf",(long double *)dst);
+}
 int dat2spec(const char *restrict a,struct timespec *restrict spec){
 	unsigned long i,n,r0;
 	i=0;n=0;
@@ -1614,11 +1643,11 @@ void psig(int sig){
 	}
 }
 
-
+char avbuf[VBUFSIZE*2048];
 int main(int argc,char **argv){
 	int cmpmode,vtype=VT_U8,r0,ret;
 	char autoexit=0,autostop=0;
-	void *back=NULL;
+	void *back=NULL,*back_arr=NULL;
 	enum smode search_mode;
 	char pid_str[BUFSIZE_PATH],*p,*p1,*format;
 	pid_t pid;
@@ -1902,7 +1931,43 @@ fnum:
 			}
 			break;
 			default:
-				break;
+				if(vtype&VT_ARRAY)
+				{
+					switch(vtype&~VT_ARRAY){
+						case VT_I8:
+							strcpy(cmd,"i8");break;
+						case VT_U8:
+							strcpy(cmd,"u8");break;
+						case VT_I16:
+							strcpy(cmd,"i16");break;
+						case VT_U16:
+							strcpy(cmd,"u16");break;
+						case VT_I32:
+							strcpy(cmd,"i32");break;
+						case VT_U32:
+							strcpy(cmd,"u32");break;
+						case VT_I64:
+							strcpy(cmd,"i64");break;
+						case VT_U64:
+							strcpy(cmd,"u64");break;
+						case VT_FLOAT:
+							strcpy(cmd,"float");break;
+						case VT_DOUBLE:
+							strcpy(cmd,"double");break;
+						case VT_LDOUBLE:
+							strcpy(cmd,"ldouble");break;
+						default:
+							goto nextloop;
+					}
+					p1=cmd+strlen(cmd);
+					*(p1++)=' ';
+					strcpy(p1,p);
+					p1=strtok(cmd," \t{},");
+					back_arr=&&back_to_write;
+					goto arr;
+back_to_write:
+					back_arr=NULL;
+				}else goto nextloop;
 		}
 		if(autostop&&!freezing)kill(pid,SIGSTOP);
 		aset_write(&as,fdmem,p,len);
@@ -2064,6 +2129,67 @@ invvalp:
 			write(STDERR_FILENO,fbuf,r0+3);
 		}
 		goto nextloop;
+	}else if(!strcmp(cmd,"array")||!strcmp(cmd,"[]")){
+		vtype=VT_ARRAY;
+		strtok(ibuf," \t");
+		if(!(p1=strtok(NULL," \t")))goto invcmd;
+arr:
+		if(!strcmp(p1,"i8")){vtype|=VT_I8;len=sizeof(int8_t);}
+		else if(!strcmp(p1,"u8")){vtype|=VT_U8;len=sizeof(int8_t);}
+		else if(!strcmp(p1,"i16")){vtype|=VT_I16;len=sizeof(int16_t);}
+		else if(!strcmp(p1,"u16")){vtype|=VT_U16;len=sizeof(uint16_t);}
+		else if(!strcmp(p1,"i32")){vtype|=VT_I32;len=sizeof(int32_t);}
+		else if(!strcmp(p1,"u32")){vtype|=VT_U32;len=sizeof(uint32_t);}
+		else if(!strcmp(p1,"i64")){vtype|=VT_I64;len=sizeof(int64_t);}
+		else if(!strcmp(p1,"u64")){vtype|=VT_U64;len=sizeof(uint64_t);}
+		else if(!strcmp(p1,"float")){vtype|=VT_FLOAT;len=sizeof(float);}
+		else if(!strcmp(p1,"double")){vtype|=VT_DOUBLE;len=sizeof(double);}
+		else if(!strcmp(p1,"ldouble")){vtype|=VT_LDOUBLE;len=sizeof(long double);}
+		else {
+			fdprintf_atomic(STDERR_FILENO,"invaild type %s\n",p);
+			goto nextloop;
+		}
+		sprintf(last_type,"%s %s",cmd,p1);
+		if(!(p1=strtok(NULL," \t{},"))){
+			goto nextloop;
+		}
+		p=avbuf;
+		do{
+			switch(vtype&~VT_ARRAY){
+				case VT_I8:
+				case VT_U8:
+				case VT_I16:
+				case VT_U16:
+				case VT_I32:
+				case VT_U32:
+				case VT_I64:
+				case VT_U64:
+					r0=atolodxs(p1,p,!(vtype&1));
+					break;
+				case VT_FLOAT:
+					r0=scanflt(p1,p);
+					break;
+				case VT_DOUBLE:
+					r0=scandbl(p1,p);
+					break;
+				case VT_LDOUBLE:
+					r0=scanldbl(p1,p);
+					break;
+				default:
+					break;
+			}
+			if(r0<1){
+			fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p1);
+			goto nextloop;
+		}
+			p+=len;
+		}while((p1=strtok(NULL," \t{},")));
+		len=p-avbuf;
+		p=avbuf;
+		if(back_arr)goto *back_arr;
+		slen=len;
+		search_mode=SEARCH_NORMAL;
+		goto search_start;
 	}else if(!strcmp(cmd,"ascii")){
 		vtype=VT_ASCII;
 		strcpy(last_type,cmd);
