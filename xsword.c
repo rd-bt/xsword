@@ -1263,6 +1263,7 @@ int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t
 	while((p=memmem_aligned(p,size-(size_t)(p-buf2),val,len,align))){
 		++n;
 		if((r0=aset_addv(as,(off_t)(mp->start+(p-buf2)),val,len))<0){
+			r0=-r0;
 			goto err;
 		}
 //		if((size_t)(p-buf2)<size)
