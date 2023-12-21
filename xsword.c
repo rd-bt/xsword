@@ -18,6 +18,7 @@
 #include <limits.h>
 #include <dirent.h>
 #include <termios.h>
+#include <elf.h>
 #define VT_I8 0
 #define VT_U8 1
 #define VT_I16 2
@@ -40,9 +41,6 @@
 #define VBUFSIZE (sizeof(long double)>sizeof(uintmax_t)?sizeof(long double):sizeof(uintmax_t))
 #define TOCSTR(x) TOCSTR0(x)
 #define TOCSTR0(x) #x
-const char copyleft[]={
-	"License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n"
-	"This is free software: you are free to change and redistribute it.\n"};
 enum smode {SEARCH_NORMAL,SEARCH_COMPARE,SEARCH_FUZZY,SEARCH_FUZZYFIX,SEARCH_RANGE};
 float epsilon_float=FLT_EPSILON;
 double epsilon_double=DBL_EPSILON;
@@ -57,6 +55,9 @@ size_t keylen=0;
 char cperms[8]={"****"};
 size_t align=1;
 int quiet=0;
+const char copyleft[]={
+"License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n"
+"This is free software: you are free to change and redistribute it.\n"};
 const char usage[]={
 "List of all commands:\n\n"
 "Scanning commands:\n"
@@ -70,9 +71,9 @@ const char usage[]={
 "u64 x -- scan unsigned 64-bit value equal to x\n"
 "i8/u8/i16/u16/i32/u32/i64/u64 x ~ -- like the prev,but x is a variation\n"
 "i8/u8/i16/u16/i32/u32/i64/u64 x y -- scan value in [x,y]nZ,Z is all value in the given type\n"
-"float x                           -- scan float value equal to x\n"
-"double x                          -- scan double value equal to x\n"
-"ldouble x                         -- scan long double value equal to x\n"
+"float,flt x                       -- scan float value equal to x\n"
+"double,dbl x                      -- scan double value equal to x\n"
+"ldouble,ldbl x                    -- scan long double value equal to x\n"
 "i8/u8/i16/u16/i32/u32/i64/u64 x-  -- scan signed/unsigned value below to x\n"
 "i8/u8/i16/u16/i32/u32/i64/u64 x-= -- scan signed/unsigned value below or equal to  x\n"
 "i8/u8/i16/u16/i32/u32/i64/u64 x+  -- scan signed/unsigned value above to x\n"
@@ -142,6 +143,129 @@ struct addrset {
 	size_t size,n;
 	int valued;
 };
+ssize_t readall(int fd,void **pbuf){
+	char *buf,*p;
+	size_t bufsiz,r1;
+	ssize_t r,ret=0;
+	int i;
+	bufsiz=BUFSIZE;
+	if((buf=malloc(BUFSIZE))==NULL)return -errno;
+	memset(buf,0,BUFSIZE);
+	lseek(fd,0,SEEK_SET);
+	r1=0;
+	while((r=read(fd,buf+ret,BUFSIZE-r1))>0){
+		r1+=r;
+		ret+=r;
+		if(ret==bufsiz){
+			bufsiz+=BUFSIZE;
+			if((p=realloc(buf,bufsiz))==NULL){
+				i=errno;
+				free(buf);
+				return -i;
+			}
+			buf=p;
+			memset(buf+bufsiz-BUFSIZE,0,BUFSIZE);
+			r1=0;
+		}
+	}
+	if(ret==bufsiz){
+	if((p=realloc(buf,bufsiz+1))==NULL){
+		i=errno;
+		free(buf);
+		return -i;
+	}
+	buf=p;
+	}
+	buf[ret]=0;
+	*pbuf=buf;
+	return ret;
+}
+typedef struct {
+	size_t size;
+	Elf64_Shdr *shp;
+	size_t shnum;
+	char *shstrtab;
+	size_t shstrtab_size;
+	char *dynstr;
+	size_t dynstr_size;
+	Elf64_Sym *dynsym;
+	size_t dynsym_num;
+	off_t text_addr;
+	off_t text_off;
+	char data[];
+} ELF;
+ELF *elf_open(const void *image,size_t len){
+	ELF *ret;
+	Elf64_Ehdr *eh;
+	size_t i;
+	if(len<4||memcmp(image,"\x7f""ELF",4)){
+		errno=EINVAL;
+		return NULL;
+	}
+	ret=(ELF *)malloc(sizeof(ELF)+len);
+	if(!ret)return NULL;
+	memset(ret,0,sizeof(ELF));
+	ret->size=len;
+	memcpy(ret->data,image,len);
+	eh=(Elf64_Ehdr *)ret->data;
+	if(eh->e_ident[EI_CLASS]!=ELFCLASS64)goto err;
+	if(eh->e_shoff>=len)goto err;
+	ret->shp=(Elf64_Shdr*)((off_t)eh+eh->e_shoff);
+	ret->shnum=eh->e_shnum;
+	if(eh->e_shstrndx>=eh->e_shnum)goto err;
+	ret->shstrtab=ret->data+ret->shp[eh->e_shstrndx].sh_offset;
+	ret->shstrtab_size=ret->shp[eh->e_shstrndx].sh_size;
+	
+	for(i=0;i<ret->shnum;++i){
+		if(!memcmp(ret->shstrtab+ret->shp[i].sh_name-1,"\0.dynstr",9)){
+			ret->dynstr=ret->data+ret->shp[i].sh_offset;
+			ret->dynstr_size=ret->shp[i].sh_size;
+		}
+		if(!memcmp(ret->shstrtab+ret->shp[i].sh_name-1,"\0.dynsym",9)){
+			ret->dynsym=(Elf64_Sym *)(ret->data+ret->shp[i].sh_offset);
+			ret->dynsym_num=ret->shp[i].sh_size/sizeof(Elf64_Sym);
+		}
+		if(!memcmp(ret->shstrtab+ret->shp[i].sh_name-1,"\0.text",7)){
+			ret->text_off=ret->shp[i].sh_offset;
+			ret->text_addr=ret->shp[i].sh_addr;
+		}
+	}
+	if(!ret->dynstr||!ret->dynsym||!ret->text_off)goto err;
+	return ret;
+err:
+	free(ret);
+	errno=EINVAL;
+	return NULL;
+}
+off_t elf_sym2off(ELF *ep,const char *symbol){
+	size_t i,len;
+	char *p;
+	len=strlen(symbol);
+	p=ep->dynstr;
+	while((p=memmem(p,ep->dynstr_size-(p-ep->dynstr),symbol,len+1))){
+		if(p[-1]==0)break;
+		else ++p;
+	}
+	if(!p)return (off_t)-1;
+	for(i=0;i<ep->dynsym_num;++i){
+		if(ep->dynsym[i].st_name==(p-ep->dynstr))return ep->dynsym[i].st_value-ep->text_addr+ep->text_off;
+	}
+	return (off_t)-1;
+}
+off_t elf_key2off(ELF *ep,const char *key_symbol){
+	size_t i,len;
+	char *p;
+	len=strlen(key_symbol);
+	p=ep->dynstr;
+	if((p=memmem(p,ep->dynstr_size-(p-ep->dynstr),key_symbol,len))){
+		while(p[-1]!=0)--p;
+	}
+	if(!p)return (off_t)-1;
+	for(i=0;i<ep->dynsym_num;++i){
+		if(ep->dynsym[i].st_name==(p-ep->dynstr))return ep->dynsym[i].st_value-ep->text_addr+ep->text_off;
+	}
+	return (off_t)-1;
+}
 typedef struct map {
 	uintptr_t start,end;
 	char perms[8];
@@ -160,6 +284,14 @@ MAP *map_open(const char *mbuf){
 	ret->off=strtok_r(ret->data,"\n",&ret->tok);
 	return ret;
 }
+MAP *map_fdopen(int fd){
+	MAP *ret;
+	char *rbuf;
+	if(readall(fd,(void **)&rbuf)<0)return NULL;
+	ret=map_open(rbuf);
+	free(rbuf);
+	return ret;
+}
 MAP *map_next(MAP *mp){
 	char format[64];
 	if(!mp->off)return NULL;
@@ -167,6 +299,12 @@ MAP *map_next(MAP *mp){
 	if(sscanf(mp->off,format,&mp->start,&mp->end,mp->perms,mp->vmname)<4)mp->vmname[0]=0;
 	mp->off=strtok_r(NULL,"\n",&mp->tok);
 	return mp;
+}
+MAP *map_search(MAP *mp,const char *vmname){
+	while(map_next(mp)){
+		if(!strcmp(mp->vmname,vmname))return mp;
+	}
+	return NULL;
 }
 size_t minz(size_t s1,size_t s2){
 	return s1>s2?s2:s1;
@@ -213,81 +351,119 @@ uint64_t gcd(uint64_t x,uint64_t y){
 	return (x|y)<<r;
 
 }
-int snum(struct user_regs_struct *restrict rs){
+long *sip(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
-	return (int)rs->regs[8];
+	return (long *)&rs->pc;
 #elif __x86_64__
-	return (int)rs->rax;
+	return (long *)&rs->rip;
 #else
-#error "unknown arch\n"
+#error "unknown arch"
 #endif
 }
-long sarg1(struct user_regs_struct *restrict rs){
+long *snum(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
-	return rs->regs[0];
+	return (long *)&rs->regs[8];
 #elif __x86_64__
-	return rs->rdi;
+	return (long *)&rs->rax;
 #else
-#error "unknown arch\n"
+#error "unknown arch"
 #endif
 }
-long sarg2(struct user_regs_struct *restrict rs){
+long *sret(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
-	return rs->regs[1];
+	return (long *)&rs->regs[0];
 #elif __x86_64__
-	return rs->rsi;
+	return (long *)&rs->rax;
 #else
-#error "unknown arch\n"
+#error "unknown arch"
 #endif
 }
-long sarg3(struct user_regs_struct *restrict rs){
+long *cret(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
-	return rs->regs[2];
+	return (long *)&rs->regs[0];
 #elif __x86_64__
-	return rs->rdx;
+	return (long *)&rs->rax;
 #else
-#error "unknown arch\n"
+#error "unknown arch"
 #endif
 }
-long sarg4(struct user_regs_struct *restrict rs){
+long *sarg1(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
-	return rs->regs[3];
+	return (long *)&rs->regs[0];
 #elif __x86_64__
-	return rs->r10;
+	return (long *)&rs->rdi;
 #else
-#error "unknown arch\n"
+#error "unknown arch"
 #endif
 }
-long sarg5(struct user_regs_struct *restrict rs){
+long *carg1(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
-	return rs->regs[4];
+	return (long *)&rs->regs[0];
 #elif __x86_64__
-	return rs->r8;
+	return (long *)&rs->rdi;
 #else
-#error "unknown arch\n"
+#error "unknown arch"
 #endif
 }
-long sarg6(struct user_regs_struct *restrict rs){
+long *sarg2(struct user_regs_struct *restrict rs){
 #ifdef __aarch64__
-	return rs->regs[5];
+	return (long *)&rs->regs[1];
 #elif __x86_64__
-	return rs->r9;
+	return (long *)&rs->rsi;
 #else
-#error "unknown arch\n"
+#error "unknown arch"
 #endif
 }
+long *sarg3(struct user_regs_struct *restrict rs){
+#ifdef __aarch64__
+	return (long *)&rs->regs[2];
+#elif __x86_64__
+	return (long *)&rs->rdx;
+#else
+#error "unknown arch"
+#endif
+}
+long *sarg4(struct user_regs_struct *restrict rs){
+#ifdef __aarch64__
+	return (long *)&rs->regs[3];
+#elif __x86_64__
+	return (long *)&rs->r10;
+#else
+#error "unknown arch"
+#endif
+}
+long *sarg5(struct user_regs_struct *restrict rs){
+#ifdef __aarch64__
+	return (long *)&rs->regs[4];
+#elif __x86_64__
+	return (long *)&rs->r8;
+#else
+#error "unknown arch"
+#endif
+}
+long *sarg6(struct user_regs_struct *restrict rs){
+#ifdef __aarch64__
+	return (long *)&rs->regs[5];
+#elif __x86_64__
+	return (long *)&rs->r9;
+#else
+#error "unknown arch"
+#endif
+}
+#define NSEC_PER_SEC 1000000000
+#define USEC_PER_SEC 1000000
 void tsadd(struct timespec *restrict d,const struct timespec *restrict s){
-	if(d->tv_nsec>=1000000000||s->tv_nsec>=1000000000)return;
+	if(d->tv_nsec>=NSEC_PER_SEC||s->tv_nsec>=NSEC_PER_SEC)return;
 	d->tv_sec+=s->tv_sec;
 	d->tv_nsec+=s->tv_nsec;
-	if(d->tv_nsec>=1000000000){
+	if(d->tv_nsec>=NSEC_PER_SEC){
 		++d->tv_sec;
-		d->tv_nsec-=1000000000;
+		d->tv_nsec-=NSEC_PER_SEC;
 		
 	}
 }
 void tssub(struct timespec *restrict d,const struct timespec *restrict s){
-	if(d->tv_nsec>=1000000000||s->tv_nsec>=1000000000)return;
+	if(d->tv_nsec>=NSEC_PER_SEC||s->tv_nsec>=NSEC_PER_SEC)return;
 	if(d->tv_sec<s->tv_sec){
 		d->tv_sec=0;
 		d->tv_nsec=0;
@@ -303,38 +479,38 @@ void tssub(struct timespec *restrict d,const struct timespec *restrict s){
 		return;
 	}
 	if(d->tv_nsec<s->tv_nsec){
-		d->tv_nsec+=1000000000;
+		d->tv_nsec+=NSEC_PER_SEC;
 		--d->tv_sec;
 	}
 	d->tv_nsec-=s->tv_nsec;
 	return;
 }
 void tsmul(struct timespec *restrict d,uint64_t factor){
-	if(d->tv_nsec>=1000000000||d->tv_nsec>=1000000000||factor==1)return;
+	if(d->tv_nsec>=NSEC_PER_SEC||d->tv_nsec>=NSEC_PER_SEC||factor==1)return;
 	d->tv_nsec*=factor;
 	d->tv_sec*=factor;
-	d->tv_sec+=d->tv_nsec/1000000000;
-	d->tv_nsec%=1000000000;
+	d->tv_sec+=d->tv_nsec/NSEC_PER_SEC;
+	d->tv_nsec%=NSEC_PER_SEC;
 }
 void tsdiv(struct timespec *restrict d,uint64_t frac){
-	if(d->tv_nsec>=1000000000||d->tv_nsec>=1000000000||frac==1)return;
-	d->tv_nsec+=d->tv_sec*1000000000;
+	if(d->tv_nsec>=NSEC_PER_SEC||d->tv_nsec>=NSEC_PER_SEC||frac==1)return;
+	d->tv_nsec+=d->tv_sec*NSEC_PER_SEC;
 	d->tv_nsec/=frac;
-	d->tv_sec=d->tv_nsec/1000000000;
-	d->tv_nsec%=1000000000;
+	d->tv_sec=d->tv_nsec/NSEC_PER_SEC;
+	d->tv_nsec%=NSEC_PER_SEC;
 }
 void tvadd(struct timeval *restrict d,const struct timeval *restrict s){
-	if(d->tv_usec>=1000000||s->tv_usec>=1000000)return;
+	if(d->tv_usec>=USEC_PER_SEC||s->tv_usec>=USEC_PER_SEC)return;
 	d->tv_sec+=s->tv_sec;
 	d->tv_usec+=s->tv_usec;
-	if(d->tv_usec>=1000000){
+	if(d->tv_usec>=USEC_PER_SEC){
 		++d->tv_sec;
-		d->tv_usec-=1000000;
+		d->tv_usec-=USEC_PER_SEC;
 		
 	}
 }
 void tvsub(struct timeval *restrict d,const struct timeval *restrict s){
-	if(d->tv_usec>=1000000||s->tv_usec>=1000000)return;
+	if(d->tv_usec>=USEC_PER_SEC||s->tv_usec>=USEC_PER_SEC)return;
 	if(d->tv_sec<s->tv_sec){
 		d->tv_sec=0;
 		d->tv_usec=0;
@@ -350,35 +526,247 @@ void tvsub(struct timeval *restrict d,const struct timeval *restrict s){
 		return;
 	}
 	if(d->tv_usec<s->tv_usec){
-		d->tv_usec+=1000000;
+		d->tv_usec+=USEC_PER_SEC;
 		--d->tv_sec;
 	}
 	d->tv_usec-=s->tv_usec;
 	return;
 }
 void tvmul(struct timeval *restrict d,uint64_t factor){
-	if(d->tv_usec>=1000000||d->tv_usec>=1000000||factor==1)return;
+	if(d->tv_usec>=USEC_PER_SEC||d->tv_usec>=USEC_PER_SEC||factor==1)return;
 	d->tv_usec*=factor;
 	d->tv_sec*=factor;
-	d->tv_sec+=d->tv_usec/1000000;
-	d->tv_usec%=1000000;
+	d->tv_sec+=d->tv_usec/USEC_PER_SEC;
+	d->tv_usec%=USEC_PER_SEC;
 }
 void tvdiv(struct timeval *restrict d,uint64_t frac){
-	if(d->tv_usec>=1000000||d->tv_usec>=1000000||frac==1)return;
-	d->tv_usec+=d->tv_sec*1000000;
+	if(d->tv_usec>=USEC_PER_SEC||d->tv_usec>=USEC_PER_SEC||frac==1)return;
+	d->tv_usec+=d->tv_sec*USEC_PER_SEC;
 	d->tv_usec/=frac;
-	d->tv_sec=d->tv_usec/1000000;
-	d->tv_usec%=1000000;
+	d->tv_sec=d->tv_usec/USEC_PER_SEC;
+	d->tv_usec%=USEC_PER_SEC;
 }
-void speed(int fdmem,pid_t pid,uint64_t factor,uint64_t frac){
+ssize_t vmread(pid_t pid,void *buf,size_t len,uintptr_t addr){
+	long l;
+	int e;
+	uintptr_t base,off,tobuf;
+	tobuf=(uintptr_t)buf;
+	base=addr&~7;
+	off=addr&7;
+	errno=0;
+	if(off){
+		errno=0;
+		l=ptrace(PTRACE_PEEKDATA,pid,base,NULL);
+		if((e=errno))return -e;
+		if(8-off<=len){
+		memcpy((void *)tobuf,(void *)((uintptr_t)&l+off),len);
+		return len;
+		}
+		memcpy((void *)tobuf,(void *)((uintptr_t)&l+off),8-off);
+		tobuf+=8-off;
+		base+=8;
+		len-=8-off;
+	}
+	while(len>=8){
+		l=ptrace(PTRACE_PEEKDATA,pid,base,NULL);
+		if((e=errno))return -e;
+		memcpy((void *)tobuf,&l,8);
+		len-=8;
+		base+=8;
+		tobuf+=8;
+	}
+	if(len){
+		l=ptrace(PTRACE_PEEKDATA,pid,base,NULL);
+		if((e=errno))return -e;
+		memcpy((void *)tobuf,&l,len);
+		base+=len;
+	}
+	return base-addr;
+}
+ssize_t vmwrite(pid_t pid,const void *buf,size_t len,uintptr_t addr){
+	long l;
+	int e;
+	uintptr_t base,off,frombuf;
+	frombuf=(uintptr_t)buf;
+	base=addr&~7;
+	off=addr&7;
+	errno=0;
+		//printf("%ld\n",frombuf);
+	if(off){
+		l=ptrace(PTRACE_PEEKDATA,pid,base,NULL);
+		if((e=errno))return -e;
+		if(8-off<=len){
+		memcpy(&l,(const void *)frombuf,len);
+		ptrace(PTRACE_POKEDATA,pid,base,l);
+		if((e=errno))return -e;
+		else return len;
+		}
+		memcpy(&l,(const void *)frombuf,off-8);
+		ptrace(PTRACE_POKEDATA,pid,base,l);
+		if((e=errno))return -e;
+		frombuf+=8-off;
+		base+=8;
+		len-=8-off;
+	}
+	while(len>=8){
+	//	printf("%ld\n",frombuf);
+		memcpy(&l,(const void *)frombuf,sizeof l);
+	//	printf("%ld\n",frombuf);
+		ptrace(PTRACE_POKEDATA,pid,base,l);
+		if((e=errno))return -e;
+		len-=8;
+		base+=8;
+		frombuf+=8;
+	}
+	if(len){
+		l=ptrace(PTRACE_PEEKDATA,pid,base,NULL);
+		if((e=errno))return -e;
+		memcpy(&l,(const void *)frombuf,len);
+		ptrace(PTRACE_POKEDATA,pid,base,l);
+		if((e=errno))return -e;
+		base+=len;
+	}
+		//exit(0);
+	return base-addr;
+}
+
+ssize_t vmwriteu(int fdmem,pid_t pid,const void *buf,size_t len,uintptr_t addr){
+	ssize_t ret;
+	ret=pwrite(fdmem,buf,len,addr);
+	if(ret<0)return vmwrite(pid,buf,len,addr);
+	else return ret;
+}
+ssize_t vmreadu(int fdmem,pid_t pid,void *buf,size_t len,uintptr_t addr){
+	ssize_t ret;
+	ret=pread(fdmem,buf,len,addr);
+	if(ret<0)return vmread(pid,buf,len,addr);
+	else return ret;
+}
+#ifdef __aarch64__
+#define BREAK_IPADD 4l
+#define BREAK_IPCUR 0l
+#define CURSED_INSTLEN 12
+char cursed_inst_syscall[]={
+	0x00,0x00,0x20,0xd4,//brk #0
+	0x01,0x00,0x00,0xd4,//svc #0
+	0xc0,0x03,0x5f,0xd6//ret
+
+};
+char cursed_inst_return[]={
+	0x00,0x00,0x20,0xd4,//brk #0
+	0xc0,0x03,0x5f,0xd6,//ret
+	0,0,0,0
+
+};
+#elif __x86_64__
+#define BREAK_IPADD 0l
+#define BREAK_IPCUR -1l
+#define CURSED_INSTLEN 4
+char cursed_inst_syscall[]={
+	0xcc,//int3
+	0x0f,0x05,//syscall
+	0xc3//ret
+};
+char cursed_inst_return[]={
+	0xcc,//int3
+	0xc3,//ret
+	0,0
+};
+#else
+#error "unknown arch"
+#endif
+
+int curse(int fdmem,pid_t pid,off_t addr,const char *cursed_inst,char *orig_inst){
+	ssize_t r0;
+	r0=vmreadu(fdmem,pid,orig_inst,CURSED_INSTLEN,addr);
+	if(r0<0)return r0;
+	r0=vmwriteu(fdmem,pid,cursed_inst,CURSED_INSTLEN,addr);
+	if(r0<0)return r0;
+	return 0;
+}
+
+int uncurse(int fdmem,pid_t pid,off_t addr,const char *orig_inst){
+	ssize_t r0;
+	r0=vmwriteu(fdmem,pid,orig_inst,CURSED_INSTLEN,addr);
+	if(r0<0)return r0;
+	return 0;
+}
+#define NS_time -1
+struct curser {
+	char *key;
+	off_t addr;
+	char orig_inst[CURSED_INSTLEN];
+	int num,state;
+} cursers[]={
+	{
+		.key="_clock_gettime",
+		.addr=0,
+		.num=SYS_clock_gettime,
+		.state=-1
+	},
+	{
+		.key="_gettimeofday",
+		.addr=0,
+		.num=SYS_gettimeofday,
+		.state=-1
+	},
+	{
+		.key="_time",
+		.addr=0,
+		.num=NS_time,
+		.state=1
+	},
+	{
+		.key=NULL
+	}
+};
+int clock_inittime(clockid_t cid,struct timespec *ts){
+	static uint64_t nclocks =0;
+	static struct timespec *cs=NULL;
+	void *p;
+	size_t i;
+	if(!ts){
+		if(cs){
+			free(cs);
+			cs=NULL;
+		}
+		nclocks=0;
+		return 0;
+	}
+	if(cid>=nclocks){
+		p=realloc(cs,(cid+1)*sizeof(struct timespec));
+		if(!p)return -1;
+		cs=p;
+		memset(cs+nclocks,0,(cid-nclocks+1)*sizeof(struct timespec));
+		for(i=nclocks;i<=cid;++i){
+			cs[i].tv_nsec=-1;
+		}
+		nclocks=cid+1;
+	}
+	if((int)cs[cid].tv_nsec==-1){
+		memcpy(cs+cid,ts,sizeof(struct timespec));
+		return 0;
+	}
+	memcpy(ts,cs+cid,sizeof(struct timespec));
+	return 0;
+}
+void speed(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac){
 	struct user_regs_struct rs;
 	struct iovec iv;
-	struct timespec ts,ts2,cts_first,cts;
+	struct timespec ts,ts2,ts_old,ts_new;
 	struct timeval tv_first,tv;
-	long addr;
-	int status,r1,r0,tv_inited=0,cts_inited=0,timeout,timeout2;
+	long i,addr;
+	clockid_t cid=-1,cid2;
+	int status,r1,r0,r2,tv_inited=0,timeout,timeout2,ksig;
+	char *vdso;
+	off_t *cip;
+	void *back=NULL;
+	time_t time_first,time2;
+	ELF *ep;
+	MAP *mp;
 	iv.iov_base=&rs;
 	iv.iov_len=sizeof rs;
+	time_first=time(NULL);
 redo:
 	if(ptrace(PTRACE_SEIZE,pid,NULL,PTRACE_O_TRACESYSGOOD)<0){
 		fdprintf_atomic(STDERR_FILENO,"cannon speed %ld (%s)\n",(long)pid,strerror(errno));
@@ -386,33 +774,98 @@ redo:
 	}
 	ptrace(PTRACE_INTERRUPT,pid,NULL,NULL);
 	r1=waitpid(pid,&status,0);
-	if(r1<0&&errno!=EINTR)goto end;
+	mp=map_fdopen(fdmap);
+	if(mp){
+		if(map_search(mp,"[vdso]")&&(vdso=malloc(mp->end-mp->start))){
+			if(vmreadu(fdmem,pid,vdso,mp->end-mp->start,mp->start)){
+				ep=elf_open(vdso,mp->end-mp->start);
+				if(ep){
+				for(i=0;cursers[i].key;++i){
+				cursers[i].addr=elf_key2off(ep,cursers[i].key);
+				if(cursers[i].addr!=(off_t)-1){
+				cursers[i].addr+=mp->start;
+				cursers[i].state=curse(fdmem,pid,cursers[i].addr,cursers[i].num<0?cursed_inst_return:cursed_inst_syscall,cursers[i].orig_inst);
+					}
+				}
+				free(ep);
+				}
+			}
+			free(vdso);
+		}
+		free(mp);
+	}
+	if(r1<0&&errno!=EINTR)goto ok;
 	while(freezing){
+rewait_syscall:
 		ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
 		r1=waitpid(pid,&status,0);
-		if(r1<0&&errno!=EINTR)goto end;
-	else if(WIFSTOPPED(status)&&!(WSTOPSIG(status)&0x80)){
+		if(cid!=-1)r2=clock_gettime(cid,&ts_old);
+		else r2=-1;
+		if(r1<0&&errno!=EINTR)goto ok;
+		else if(WIFSTOPPED(status)){
+			if(WSTOPSIG(status)==SIGTRAP){
+				if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto err;
+				cip=sip(&rs);
+				for(i=0;cursers[i].key;++i){
+					if(cursers[i].state>=0&&*cip+BREAK_IPCUR==cursers[i].addr){
+						switch(cursers[i].num){
+							case NS_time:
+				addr=*carg1(&rs);
+				if(tv_inited){
+				 	gettimeofday(&tv,NULL);
+					tvsub(&tv,&tv_first);
+					tvmul(&tv,factor);
+					tvdiv(&tv,frac);
+					tvadd(&tv,&tv_first);
+					time2=tv.tv_sec;
+				}else {
+					time2=time(NULL);
+					time2=(time2-time_first)*factor/frac+time_first;
+				}
+				*cret(&rs)=time2;
+				if(addr)vmwriteu(fdmem,pid,&time2,sizeof time2,addr);
+				break;
+							default:
+								*snum(&rs)=cursers[i].num;
+						}
+					}
+				}
+				*cip+=BREAK_IPADD;
+				if(ptrace(PTRACE_SETREGSET,pid,1,&iv)<0)goto err;
+				goto rewait_syscall;
+			}
+			else if(!(WSTOPSIG(status)&0x80)){
+			ksig=WSTOPSIG(status);
+			back=&&killed;
+			goto end;
 killed:
-		ptrace(PTRACE_DETACH,pid,NULL,NULL);
-		kill(pid,WSTOPSIG(status));
-		goto redo;
+			kill(pid,ksig);
+			goto redo;
+			}
 		}
-		if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto killed;
-		r0=snum(&rs);
+		if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto err;
+		r0=*snum(&rs);
 		switch(r0){
+			case SYS_clock_gettime:
+				cid2=*sarg1(&rs);
+				break;
 			case SYS_nanosleep:
-				addr=sarg1(&rs);
+				addr=*sarg1(&rs);
+				cid2=CLOCK_REALTIME;
 				goto spec_addr_got;
 			case SYS_clock_nanosleep:
-				addr=sarg3(&rs);
+				addr=*sarg3(&rs);
+				cid2=*sarg1(&rs);
 				goto spec_addr_got;
 			case SYS_pselect6:
-				addr=sarg5(&rs);
+				addr=*sarg5(&rs);
+				cid2=CLOCK_REALTIME;
 				goto spec_addr_got;
 			case SYS_ppoll:
-				addr=sarg3(&rs);
+				addr=*sarg3(&rs);
+				cid2=CLOCK_REALTIME;
 spec_addr_got:
-				if(!addr||pread(fdmem,&ts,sizeof ts,addr)<0)break;
+				if(!addr||vmreadu(fdmem,pid,&ts,sizeof ts,addr)<0)break;
 				memcpy(&ts2,&ts,sizeof ts);
 				if(factor){
 					tsmul(&ts,frac);
@@ -421,71 +874,106 @@ spec_addr_got:
 					ts.tv_sec=0;
 					ts.tv_nsec=0;
 				}
-				pwrite(fdmem,&ts,sizeof ts,addr);
+				if(r2>=0&&!clock_gettime(cid,&ts_new)){
+					tssub(&ts_new,&ts_old);
+					tssub(&ts,&ts_new);
+				}
+				vmwriteu(fdmem,pid,&ts,sizeof ts,addr);
 				break;
 			case SYS_epoll_pwait:
-				addr=sarg4(&rs);
-				if(!addr||pread(fdmem,&timeout,sizeof timeout,addr)<0)break;
+				addr=*sarg4(&rs);
+				if(!addr||vmreadu(fdmem,pid,&timeout,sizeof timeout,addr)<0)break;
 				timeout2=timeout;
-				if(timeout==-1)break;
+				if(timeout<=0)break;
 				if(factor){
 					timeout*=frac;
 					timeout/=factor;
 				}else{
 					timeout=0;
 				}
-				pwrite(fdmem,&timeout,sizeof timeout,addr);
+				if(r2>=0&&!clock_gettime(cid,&ts_new)){
+					tssub(&ts_new,&ts_old);
+					timeout-=ts_new.tv_sec*USEC_PER_SEC+ts_new.tv_nsec/1000;
+					if(timeout<0)timeout=0;
+				}
+				vmwriteu(fdmem,pid,&timeout,sizeof timeout,addr);
 				break;
 			default:
 				break;
 		}
 		ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
 		r1=waitpid(pid,&status,0);
-		if(r1<0&&errno!=EINTR)goto end;
+		if(r1<0&&errno!=EINTR)goto ok;
 		switch(r0){
 			case SYS_clock_nanosleep:
 			case SYS_nanosleep:
 			case SYS_pselect6:
 			case SYS_ppoll:
-				if(addr)pwrite(fdmem,&ts2,sizeof ts,addr);
+				if(addr){
+					vmwriteu(fdmem,pid,&ts2,sizeof ts,addr);
+					if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto err;
+					if(*sret(&rs)>=0)cid=cid2;
+				}
 				break;
 			case SYS_epoll_pwait:
-				if(addr)pwrite(fdmem,&timeout2,sizeof timeout,addr);
+				if(addr)vmwriteu(fdmem,pid,&timeout2,sizeof timeout,addr);
 				break;
 			case SYS_gettimeofday:
-				addr=sarg1(&rs);
-				if(tv_inited){
-					if(pread(fdmem,&tv,sizeof tv,addr)<0)break;
+				addr=*sarg1(&rs);
+				if(addr){
+					if(tv_inited){
+					if(vmreadu(fdmem,pid,&tv,sizeof tv,addr)<0)break;
 					tvsub(&tv,&tv_first);
 					tvmul(&tv,factor);
 					tvdiv(&tv,frac);
 					tvadd(&tv,&tv_first);
-					pwrite(fdmem,&tv,sizeof tv,addr);
+					vmwriteu(fdmem,pid,&tv,sizeof tv,addr);
 				}else {
-					if(pread(fdmem,&tv_first,sizeof tv,addr)>0)
+					if(vmreadu(fdmem,pid,&tv_first,sizeof tv,addr)>0)
 					tv_inited=1;
+				}
 				}
 				break;
 			case SYS_clock_gettime:
-				addr=sarg2(&rs);
-				if(cts_inited){
-					if(pread(fdmem,&cts,sizeof cts,addr)<0)break;
-					tssub(&cts,&cts_first);
-					tsmul(&cts,factor);
-					tsdiv(&cts,frac);
-					tsadd(&cts,&cts_first);
-					pwrite(fdmem,&cts,sizeof cts,addr);
-				}else {
-					if(pread(fdmem,&cts_first,sizeof cts,addr)>0)
-					cts_inited=1;
+				addr=*sarg2(&rs);
+				if(!addr||vmreadu(fdmem,pid,&ts,sizeof ts,addr)<0)break;
+				memcpy(&ts2,&ts,sizeof ts);
+				if(*sret(&rs)>=0&&clock_inittime(cid2,&ts2)==0){
+					tssub(&ts,&ts2);
+					tsmul(&ts,factor);
+					tsdiv(&ts,frac);
+					tsadd(&ts,&ts2);
+					vmwriteu(fdmem,pid,&ts,sizeof ts,addr);
 				}
 				break;
 			default:
 				break;
 		}
 	}
+ok:
+	back=NULL;
 end:
+	ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
+	r1=waitpid(pid,&status,0);
+	(r1=ptrace(PTRACE_GETREGSET,pid,1,&iv))>=0&&(cip=sip(&rs));
+	for(i=0;cursers[i].key;++i){
+		if(cursers[i].state>=0){
+			uncurse(fdmem,pid,cursers[i].addr,cursers[i].orig_inst);
+			if(r1>=0){
+				if(*cip+BREAK_IPCUR==cursers[i].addr){
+					*cip+=BREAK_IPCUR;
+					ptrace(PTRACE_SETREGSET,pid,1,&iv);
+				}
+			}
+		}
+	}
 	ptrace(PTRACE_DETACH,pid,NULL,NULL);
+	clock_inittime(0,NULL);
+	if(back)goto *back;
+	return;
+err:
+	back=&&redo;
+	goto end;
 }
 
 const char *bfname(const char *path){
@@ -589,12 +1077,12 @@ void aset_wipe(struct addrset *restrict aset){
 	aset_init(aset);
 }
 void aset_list(struct addrset *restrict aset,int fdmem,int vtype,size_t len){
-	size_t i,i2,ilen,olen;
+	size_t i,i2,ilen,ulen;
 	char *buf,*obuf;
 	int64_t l;
 	uint64_t u;
-	int toa=0,r,array=0;
-	olen=len;
+	int toa=0,array=0;
+	short r;
 	if(vtype&VT_ARRAY){
 		array=1;
 		vtype&=~VT_ARRAY;
@@ -605,49 +1093,47 @@ void aset_list(struct addrset *restrict aset,int fdmem,int vtype,size_t len){
 				break;
 			case VT_I8:
 			case VT_U8:
-				len=sizeof(int8_t);
+				ulen=sizeof(int8_t);
 				goto num;
 			case VT_I16:
 			case VT_U16:
-				len=sizeof(int16_t);
+				ulen=sizeof(int16_t);
 				goto num;
 			case VT_I32:
 			case VT_U32:
-				len=sizeof(int32_t);
+				ulen=sizeof(int32_t);
 				goto num;
 			case VT_I64:
 			case VT_U64:
-				len=sizeof(int64_t);
+				ulen=sizeof(int64_t);
 				goto num;
 num:
-				if(!array)olen=len;
 				toa=1;
 				break;
 			case VT_FLOAT:
-				len=sizeof(float);
+				ulen=sizeof(float);
 				goto fnum;
 			case VT_DOUBLE:
-				len=sizeof(double);
+				ulen=sizeof(double);
 				goto fnum;
 			case VT_LDOUBLE:
-				len=sizeof(long double);
+				ulen=sizeof(long double);
 				goto fnum;
 fnum:
-				if(!array)olen=len;
 				toa=2;
 				break;
 			default:
 				break;
 		}
-	if(array)ilen=olen/len;
-	buf=malloc((olen+15)&~15);
+	if(array)ilen=len/ulen;
+	buf=malloc(len);
 	if(!buf){
 		fdprintf_atomic(STDERR_FILENO,"failed (%s)\n",strerror(errno));
 		return;
 	}
 		freezing=1;
 	for(i=0;i<aset->n&&freezing;++i){
-		if(pread(fdmem,buf,olen,aset->buf[i].addr)<=0){
+		if(pread(fdmem,buf,len,aset->buf[i].addr)<=0){
 			fprintf(stdout,"%lx ???\n",aset->buf[i].addr);
 			continue;
 		}
@@ -787,43 +1273,7 @@ int permscmp(const char *restrict s1,const char *restrict s2){
 	return 0;
 }
 
-ssize_t readall(int fd,void **pbuf){
-	char *buf,*p;
-	size_t bufsiz,r1;
-	ssize_t r,ret=0;
-	int i;
-	bufsiz=BUFSIZE;
-	if((buf=malloc(BUFSIZE))==NULL)return -errno;
-	memset(buf,0,BUFSIZE);
-	lseek(fd,0,SEEK_SET);
-	r1=0;
-	while((r=read(fd,buf+ret,BUFSIZE-r1))>0){
-		r1+=r;
-		ret+=r;
-		if(ret==bufsiz){
-			bufsiz+=BUFSIZE;
-			if((p=realloc(buf,bufsiz))==NULL){
-				i=errno;
-				free(buf);
-				return -i;
-			}
-			buf=p;
-			memset(buf+bufsiz-BUFSIZE,0,BUFSIZE);
-			r1=0;
-		}
-	}
-	if(ret==bufsiz){
-	if((p=realloc(buf,bufsiz+1))==NULL){
-		i=errno;
-		free(buf);
-		return -i;
-	}
-	buf=p;
-	}
-	buf[ret]=0;
-	*pbuf=buf;
-	return ret;
-}
+
 int ucmpgt8(const void *d,const void *s){
 	return *(uint8_t *)d>*(uint8_t *)s;
 }
@@ -1635,6 +2085,7 @@ volatile sig_atomic_t fdmem=-1,fdmap=-1,ioret=-1;
 void psig(int sig){
 	switch(sig){
 		case SIGINT:
+		case SIGALRM:
 			if(next_freezing){
 				next_freezing=0;
 			}else if(freezing){
@@ -1648,8 +2099,6 @@ void psig(int sig){
 			}
 			break;
 		case SIGABRT:
-			break;
-		case SIGALRM:
 			break;
 		case SIGUSR1:
 			break;
@@ -1708,6 +2157,7 @@ int main(int argc,char **argv){
 	aset_init(&as);
 	setvbuf(stdout,buf_stdout,_IOFBF,BUFSIZE_STDOUT);
 	signal(SIGINT,psig);
+	signal(SIGALRM,psig);
 	for(i=2;argv[i];++i){
 		strcpy(ibuf,argv[i]);
 		back=&&here;
@@ -1789,6 +2239,22 @@ back_to_next:
 			helpcmd(p);
 		}
 		else help(argv[0]);
+		goto nextloop;
+	}else if(!strcmp(cmd,"alarm")||!strcmp(cmd,"alrm")){
+		strtok(ibuf," \t");
+		p=strtok(NULL," \t");
+		if(p){
+			if(atolodx(p,&l)==1){
+				r0=(int)l;
+			}
+			else {
+				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
+				goto nextloop;
+			}
+		}else {
+			r0=0;
+		}
+		alarm(r0);
 		goto nextloop;
 	}else if(!strcmp(cmd,"stop")||!strcmp(cmd,"s")){
 		if(kill(pid,SIGSTOP)<0)fdprintf_atomic(STDERR_FILENO,"kill failed (%s)\n",strerror(errno));
@@ -2031,6 +2497,9 @@ back_to_freeze:
 		goto nextloop;
 	}else if(!strcmp(cmd,"limit")){
 		fprintf(stdout,
+				"ldouble:%Lf\n"
+				"double:%lf\n"
+				"float:%f\n"
 				"i8:%hhd - %hhd\n"
 				"u8:%hhu\n"
 				"i16:%hd - %hd\n"
@@ -2039,10 +2508,8 @@ back_to_freeze:
 				"u32:%u\n"
 				"i64:%ld - %ld\n"
 				"u64:%lu\n"
-				"float:%f\n"
-				"double:%lf\n"
-				"ldouble:%Lf\n"
-				,INT8_MIN,INT8_MAX,UINT8_MAX,INT16_MIN,INT16_MAX,UINT16_MAX,INT32_MIN,INT32_MAX,UINT32_MAX,INT64_MIN,INT64_MAX,UINT64_MAX,FLT_MAX,DBL_MAX,LDBL_MAX);
+
+				,LDBL_MAX,DBL_MAX,FLT_MAX,INT8_MIN,INT8_MAX,UINT8_MAX,INT16_MIN,INT16_MAX,UINT16_MAX,INT32_MIN,INT32_MAX,UINT32_MAX,INT64_MIN,INT64_MAX,UINT64_MAX);
 		fflush(stdout);
 		goto nextloop;
 	}else if(!strcmp(cmd,"align")||!strcmp(cmd,"a")){
@@ -2072,7 +2539,7 @@ back_to_freeze:
 				l/=u2;
 				u/=u2;
 				freezing=1;
-				speed(fdmem,pid,l,u);
+				speed(fdmap,fdmem,pid,l,u);
 				freezing=0;
 			}
 			else {
@@ -2227,7 +2694,7 @@ arr:
 		search_mode=SEARCH_NORMAL;
 		goto search_start;
 	}else if(!strcmp(cmd,"i8")||!strcmp(cmd,"u8")){
-		len=sizeof(int8_t);
+		slen=len=sizeof(int8_t);
 		vtype=cmd[0]=='i'?VT_I8:VT_U8;
 int_uni:
 		strcpy(last_type,cmd);
@@ -2270,25 +2737,25 @@ int_uni:
 		}else goto nextloop;
 		goto search_start;
 	}else if(!strcmp(cmd,"i16")||!strcmp(cmd,"u16")){
-		len=sizeof(int16_t);
+		slen=len=sizeof(int16_t);
 		vtype=cmd[0]=='i'?VT_I16:VT_U16;
 		goto int_uni;
 	}else if(!strcmp(cmd,"i32")||!strcmp(cmd,"u32")){
-		len=sizeof(int32_t);
+		slen=len=sizeof(int32_t);
 		vtype=cmd[0]=='i'?VT_I32:VT_U32;
 		goto int_uni;
 	}else if(!strcmp(cmd,"i64")||!strcmp(cmd,"u64")){
-		len=sizeof(int64_t);
+		slen=len=sizeof(int64_t);
 		vtype=cmd[0]=='i'?VT_I64:VT_U64;
 		goto int_uni;
-	}else if(!strcmp(cmd,"float")){
+	}else if(!strcmp(cmd,"float")||!strcmp(cmd,"flt")){
 		vtype=VT_FLOAT;
 		strcpy(last_type,cmd);
 		strtok(ibuf," \t");
 		p1=strtok(NULL," \t");
 		search_mode=SEARCH_NORMAL;
 		if(p1){
-			len=sizeof(float);
+			slen=len=sizeof(float);
 			if(sscanf(p1,"%f",(float *)vbuf)==1){
 				p=vbuf;
 				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
@@ -2302,14 +2769,14 @@ int_uni:
 			}
 		}else goto nextloop;
 		goto search_start;
-	}else if(!strcmp(cmd,"double")){
+	}else if(!strcmp(cmd,"double")||!strcmp(cmd,"dbl")){
 		vtype=VT_DOUBLE;
 		strcpy(last_type,cmd);
 		strtok(ibuf," \t");
 		p1=strtok(NULL," \t");
 		search_mode=SEARCH_NORMAL;
 		if(p1){
-			len=sizeof(double);
+			slen=len=sizeof(double);
 			if(sscanf(p1,"%lf",(double *)vbuf)==1){
 				p=vbuf;
 				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
@@ -2322,14 +2789,14 @@ int_uni:
 			}
 		}else goto nextloop;
 		goto search_start;
-	}else if(!strcmp(cmd,"ldouble")){
+	}else if(!strcmp(cmd,"ldouble")||!strcmp(cmd,"ldbl")){
 		vtype=VT_LDOUBLE;
 		strcpy(last_type,cmd);
 		strtok(ibuf," \t");
 		p1=strtok(NULL," \t");
 		search_mode=SEARCH_NORMAL;
 		if(p1){
-			len=sizeof(long double);
+			slen=len=sizeof(long double);
 			if(sscanf(p1,"%Lf",(long double *)vbuf)==1){
 				p=vbuf;
 				if(getcmpmode(p1,&cmpmode))search_mode=SEARCH_COMPARE;
