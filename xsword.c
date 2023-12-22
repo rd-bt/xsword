@@ -95,6 +95,7 @@ const char usage[]={
 "ascii x -- scan continuous bytes equal to x\n"
 "string x -- scan continuous bytes terminated by 0 equal to x\n"
 "\nOther commands:\n"
+"alarm,alrm [x] -- call alarm(x),default x=0\n"
 "alen,al [x] -- show or set the ascii length\n"
 "align,a [x] -- show or set the aligning bytes\n"
 "autoexit,--autoexit,-e -- exit if no value hit in scanning\n"
@@ -127,7 +128,7 @@ const char usage[]={
 "reset,r -- wipe values hit\n"
 "select,se x1,x2,... -- hit listed address\n"
 "sleep,sp x -- enter the TASK_INTERRUPTIBLE state for x(decimal) seconds\n"
-"speed x [y] -- modify sleeping time to y/x times and make current time increase x/y times faster,default y=1\n"
+"speed x [y] [start_time]-- modify sleeping time to y/x times and make current time increase x/y times faster,default y=1,set start time of CLOCK_REALTIME to start_time(if given,in decimal unix timestamp)\n"
 "stop,s -- send SIGSTOP\n"
 "update,u -- update recorded values\n"
 "write,w x -- write x to hit addresses\n"
@@ -546,6 +547,7 @@ void tvdiv(struct timeval *restrict d,uint64_t frac){
 	d->tv_sec=d->tv_usec/USEC_PER_SEC;
 	d->tv_usec%=USEC_PER_SEC;
 }
+/*
 ssize_t vmread(pid_t pid,void *buf,size_t len,uintptr_t addr){
 	long l;
 	int e;
@@ -629,17 +631,31 @@ ssize_t vmwrite(pid_t pid,const void *buf,size_t len,uintptr_t addr){
 		//exit(0);
 	return base-addr;
 }
-
+*/
 ssize_t vmwriteu(int fdmem,pid_t pid,const void *buf,size_t len,uintptr_t addr){
 	ssize_t ret;
-	ret=pwrite(fdmem,buf,len,addr);
-	if(ret<0)return vmwrite(pid,buf,len,addr);
+	struct iovec lv,rv;
+	ret=fdmem>=0?pwrite(fdmem,buf,len,addr):-1;
+	if(ret<0){
+		lv.iov_base=(void *)buf;
+		rv.iov_base=(void *)addr;
+		lv.iov_len=rv.iov_len=len;
+		return process_vm_writev(pid,&lv,1,&rv,1,0);
+		//return vmwrite(pid,buf,len,addr);
+	}
 	else return ret;
 }
 ssize_t vmreadu(int fdmem,pid_t pid,void *buf,size_t len,uintptr_t addr){
 	ssize_t ret;
-	ret=pread(fdmem,buf,len,addr);
-	if(ret<0)return vmread(pid,buf,len,addr);
+	struct iovec lv,rv;
+	ret=fdmem>=0?pread(fdmem,buf,len,addr):-1;
+	if(ret<0){
+		lv.iov_base=buf;
+		rv.iov_base=(void *)addr;
+		lv.iov_len=rv.iov_len=len;
+		return process_vm_readv(pid,&lv,1,&rv,1,0);
+		//return vmread(pid,buf,len,addr);
+	}
 	else return ret;
 }
 #ifdef __aarch64__
@@ -720,57 +736,78 @@ struct curser {
 		.key=NULL
 	}
 };
-int clock_inittime(clockid_t cid,struct timespec *ts){
-	static uint64_t nclocks =0;
-	static struct timespec *cs=NULL;
+struct inittime {
+	struct timespec *cs;
+	uint64_t nclocks;
+};
+int clock_inittime(clockid_t cid,struct timespec *ts,struct inittime *it){
 	void *p;
 	size_t i;
 	if(!ts){
-		if(cs){
-			free(cs);
-			cs=NULL;
+		if(it->cs){
+			free(it->cs);
+			it->cs=NULL;
 		}
-		nclocks=0;
+		it->nclocks=0;
 		return 0;
 	}
-	if(cid>=nclocks){
-		p=realloc(cs,(cid+1)*sizeof(struct timespec));
+	if(cid>=it->nclocks){
+		p=realloc(it->cs,(cid+1)*sizeof(struct timespec));
 		if(!p)return -1;
-		cs=p;
-		memset(cs+nclocks,0,(cid-nclocks+1)*sizeof(struct timespec));
-		for(i=nclocks;i<=cid;++i){
-			cs[i].tv_nsec=-1;
+		it->cs=p;
+		memset(it->cs+it->nclocks,0,(cid-it->nclocks+1)*sizeof(struct timespec));
+		for(i=it->nclocks;i<=cid;++i){
+			it->cs[i].tv_nsec=-1;
 		}
-		nclocks=cid+1;
+		it->nclocks=cid+1;
 	}
-	if((int)cs[cid].tv_nsec==-1){
-		memcpy(cs+cid,ts,sizeof(struct timespec));
+	if((int)it->cs[cid].tv_nsec==-1){
+		memcpy(it->cs+cid,ts,sizeof(struct timespec));
 		return 0;
 	}
-	memcpy(ts,cs+cid,sizeof(struct timespec));
+	memcpy(ts,it->cs+cid,sizeof(struct timespec));
 	return 0;
 }
-void speed(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac){
+void speed(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time){
 	struct user_regs_struct rs;
 	struct iovec iv;
-	struct timespec ts,ts2,ts_old,ts_new;
-	struct timeval tv_first,tv;
+	struct timespec ts_base,ts,ts2,ts_old,ts_new;
+	struct timeval tv_first,tv_base,tv;
 	long i,addr;
 	clockid_t cid=-1,cid2;
 	int status,r1,r0,r2,tv_inited=0,timeout,timeout2,ksig;
-	char *vdso;
+	char *vdso,buf[64],*p;
 	off_t *cip;
 	void *back=NULL;
-	time_t time_first,time2;
+	time_t time2;
+	struct inittime it={.cs=NULL,.nclocks=0};
 	ELF *ep;
 	MAP *mp;
 	iv.iov_base=&rs;
 	iv.iov_len=sizeof rs;
-	time_first=time(NULL);
+	if(start_time){
+		memcpy(&ts_base,start_time,sizeof ts);
+	}else {
+		clock_gettime(CLOCK_REALTIME,&ts_base);
+	}
+	//clock_inittime(CLOCK_REALTIME,&ts,&it);
+	//clock_inittime(CLOCK_REALTIME_ALARM,&ts,&it);
+	//clock_inittime(CLOCK_REALTIME_COARSE,&ts,&it);
+	//clock_inittime(CLOCK_TAI,&ts,&it);
+	tv_base.tv_sec=ts_base.tv_sec;
+	tv_base.tv_usec=ts_base.tv_nsec/1000;
 redo:
 	if(ptrace(PTRACE_SEIZE,pid,NULL,PTRACE_O_TRACESYSGOOD)<0){
 		fdprintf_atomic(STDERR_FILENO,"cannon speed %ld (%s)\n",(long)pid,strerror(errno));
+		clock_inittime(0,NULL,&it);
 		return;
+	}else {
+		p=ctime_r(&tv_base.tv_sec,buf);
+		if(!p){
+			sprintf(buf,"%lu\n",tv_base.tv_sec);
+			p=buf;
+		}
+		fdprintf_atomic(STDERR_FILENO,"speeding %ld at %s",pid,p);
 	}
 	ptrace(PTRACE_INTERRUPT,pid,NULL,NULL);
 	r1=waitpid(pid,&status,0);
@@ -779,6 +816,7 @@ redo:
 		if(map_search(mp,"[vdso]")&&(vdso=malloc(mp->end-mp->start))){
 			if(vmreadu(fdmem,pid,vdso,mp->end-mp->start,mp->start)){
 				ep=elf_open(vdso,mp->end-mp->start);
+				//ep=NULL;//
 				if(ep){
 				for(i=0;cursers[i].key;++i){
 				cursers[i].addr=elf_key2off(ep,cursers[i].key);
@@ -816,11 +854,12 @@ rewait_syscall:
 					tvsub(&tv,&tv_first);
 					tvmul(&tv,factor);
 					tvdiv(&tv,frac);
-					tvadd(&tv,&tv_first);
+					tvadd(&tv,&tv_base);
 					time2=tv.tv_sec;
 				}else {
-					time2=time(NULL);
-					time2=(time2-time_first)*factor/frac+time_first;
+					gettimeofday(&tv_first,NULL);
+					tv_inited=1;
+					time2=tv_base.tv_sec;
 				}
 				*cret(&rs)=time2;
 				if(addr)vmwriteu(fdmem,pid,&time2,sizeof time2,addr);
@@ -834,6 +873,9 @@ rewait_syscall:
 				if(ptrace(PTRACE_SETREGSET,pid,1,&iv)<0)goto err;
 				goto rewait_syscall;
 			}
+			else if(WSTOPSIG(status)==SIGCHLD){
+				goto rewait_syscall;
+			}
 			else if(!(WSTOPSIG(status)&0x80)){
 			ksig=WSTOPSIG(status);
 			back=&&killed;
@@ -845,6 +887,7 @@ killed:
 		}
 		if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto err;
 		r0=*snum(&rs);
+		//r0=0;//
 		switch(r0){
 			case SYS_clock_gettime:
 				cid2=*sarg1(&rs);
@@ -926,23 +969,36 @@ spec_addr_got:
 					tvsub(&tv,&tv_first);
 					tvmul(&tv,factor);
 					tvdiv(&tv,frac);
-					tvadd(&tv,&tv_first);
+					tvadd(&tv,&tv_base);
 					vmwriteu(fdmem,pid,&tv,sizeof tv,addr);
 				}else {
-					if(vmreadu(fdmem,pid,&tv_first,sizeof tv,addr)>0)
+					if(vmreadu(fdmem,pid,&tv_first,sizeof tv,addr)>0){
 					tv_inited=1;
+					vmwriteu(fdmem,pid,&tv_base,sizeof tv,addr);
+					}
 				}
 				}
 				break;
 			case SYS_clock_gettime:
 				addr=*sarg2(&rs);
+				cid2=*sarg1(&rs);
 				if(!addr||vmreadu(fdmem,pid,&ts,sizeof ts,addr)<0)break;
 				memcpy(&ts2,&ts,sizeof ts);
-				if(*sret(&rs)>=0&&clock_inittime(cid2,&ts2)==0){
+				if(*sret(&rs)>=0&&clock_inittime(cid2,&ts2,&it)==0){
 					tssub(&ts,&ts2);
 					tsmul(&ts,factor);
 					tsdiv(&ts,frac);
-					tsadd(&ts,&ts2);
+					switch(cid2){
+						case CLOCK_REALTIME:
+						case CLOCK_REALTIME_ALARM:
+						case CLOCK_REALTIME_COARSE:
+						case CLOCK_TAI:
+							tsadd(&ts,&ts_base);
+							break;
+						default:
+							tsadd(&ts,&ts2);
+							break;
+					}
 					vmwriteu(fdmem,pid,&ts,sizeof ts,addr);
 				}
 				break;
@@ -968,8 +1024,8 @@ end:
 		}
 	}
 	ptrace(PTRACE_DETACH,pid,NULL,NULL);
-	clock_inittime(0,NULL);
 	if(back)goto *back;
+	clock_inittime(0,NULL,&it);
 	return;
 err:
 	back=&&redo;
@@ -1076,7 +1132,7 @@ void aset_wipe(struct addrset *restrict aset){
 	aset_free(aset);
 	aset_init(aset);
 }
-void aset_list(struct addrset *restrict aset,int fdmem,int vtype,size_t len){
+void aset_list(struct addrset *restrict aset,int fdmem,pid_t pid,int vtype,size_t len){
 	size_t i,i2,ilen,ulen;
 	char *buf,*obuf;
 	int64_t l;
@@ -1133,7 +1189,7 @@ fnum:
 	}
 		freezing=1;
 	for(i=0;i<aset->n&&freezing;++i){
-		if(pread(fdmem,buf,len,aset->buf[i].addr)<=0){
+		if(vmreadu(fdmem,pid,buf,len,aset->buf[i].addr)<=0){
 			fprintf(stdout,"%lx ???\n",aset->buf[i].addr);
 			continue;
 		}
@@ -1211,7 +1267,7 @@ endf1:
 	freezing=0;
 	free(buf);
 }
-void aset_wlist(struct addrset *restrict aset,int fdmem,int vtype){
+void aset_wlist(struct addrset *restrict aset,int fdmem,pid_t pid,int vtype){
 	size_t i=0,len;
 	char *buf;
 		switch(vtype){
@@ -1249,7 +1305,7 @@ void aset_wlist(struct addrset *restrict aset,int fdmem,int vtype){
 	buf=malloc((len+15)&~15);
 	freezing=1;
 	while(i<aset->n&&freezing){
-		if(pread(fdmem,buf,len,aset->buf[i].addr)==len){
+		if(vmreadu(fdmem,pid,buf,len,aset->buf[i].addr)==len){
 			aset->valued=1;
 			memcpy(aset->buf[i].val,buf,len);
 		}
@@ -1258,10 +1314,10 @@ void aset_wlist(struct addrset *restrict aset,int fdmem,int vtype){
 	freezing=0;
 	free(buf);
 }
-void aset_write(struct addrset *restrict aset,int fdmem,void *val,size_t len){
+void aset_write(struct addrset *restrict aset,int fdmem,pid_t pid,void *val,size_t len){
 	size_t i=0;
 	while(i<aset->n){
-		pwrite(fdmem,val,len,aset->buf[i].addr);
+		vmwriteu(fdmem,pid,val,len,aset->buf[i].addr);
 		++i;
 	}
 }
@@ -1568,7 +1624,7 @@ struct range_struct{
 	int64_t supi;
 	int64_t infi;
 };
-int researchu(enum smode search_mode,const struct addrset *restrict oldas,int fdmem,const void *restrict val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
+int researchu(enum smode search_mode,const struct addrset *restrict oldas,int fdmem,pid_t pid,const void *restrict val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
 	ssize_t i=0,n=0,ilast,s;
 	char *buf=NULL;
 	int r0;
@@ -1581,7 +1637,7 @@ int researchu(enum smode search_mode,const struct addrset *restrict oldas,int fd
 	ilast=-oldas->n;
 	s=oldas->n/100+!!(oldas->n%100);
 	while(i<oldas->n&&freezing){
-		if(pread(fdmem,buf,len,oldas->buf[i].addr)==len){
+		if(vmreadu(fdmem,pid,buf,len,oldas->buf[i].addr)==len){
 			switch(search_mode){
 				case SEARCH_COMPARE:
 					goto compare;
@@ -1648,7 +1704,7 @@ end:
 	free(buf);
 	return 0;
 }
-int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
+int searchu(enum smode search_mode,int fdmap,int fdmem,pid_t pid,void *restrict val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
 	char *buf2=NULL,*rbuf=NULL;
 	MAP *mp=NULL;
 	char *p;
@@ -1691,7 +1747,7 @@ int searchu(enum smode search_mode,int fdmap,int fdmem,void *restrict val,size_t
 		goto err;
 	}
 	buf2=p;
-	r0=pread(fdmem,buf2,size,mp->start);
+	r0=vmreadu(fdmem,pid,buf2,size,mp->start);
 	r1=errno;
 	if(!quiet)lline+=write(STDERR_FILENO," -> ",4);
 	if(r0==0)goto notfound;
@@ -2108,6 +2164,12 @@ void psig(int sig){
 }
 
 char avbuf[VBUFSIZE*2048];
+int y2stamp(const char *str,time_t *tp){
+	time_t y;
+	if(sscanf(str,"y%lu",&y)<1||y<1970)return 0;
+	*tp=(y-1968)/4*((365*3+366)*86400)+(y-1968)%4*(365*86400)-(365*2*86400)-(y%4?0:86400);
+	return 1;
+}
 int main(int argc,char **argv){
 	int cmpmode,vtype=VT_U8,r0,ret;
 	char autoexit=0,autostop=0;
@@ -2125,6 +2187,9 @@ int main(int argc,char **argv){
 	uint64_t u,u2;
 	off_t addr;
 	struct termios argp;
+	struct timespec st_time;
+	struct tm tm0;
+	struct timespec *start_time;
 	struct range_struct rs;
 	args=argv;
 	last_type[0]=0;
@@ -2279,7 +2344,7 @@ back_to_next:
 		if(kill(pid,r0)<0)fdprintf_atomic(STDERR_FILENO,"kill failed (%s)\n",strerror(errno));
 		goto nextloop;
 	}else if(!strcmp(cmd,"list")||!strcmp(cmd,"l")||!strcmp(cmd,"ls")){
-		aset_list(&as,fdmem,vtype,slen);
+		aset_list(&as,fdmem,pid,vtype,slen);
 		goto nextloop;
 	}else if(!strcmp(cmd,"pid")){
 		fdprintf_atomic(STDERR_FILENO,"%s\n",pid_str);
@@ -2341,7 +2406,7 @@ back_to_next:
 		memcpy(keywords,ibuf+4,(keylen=strlen(ibuf+4))+1);
 		goto nextloop;
 	}else if(!strcmp(cmd,"update")||!strcmp(cmd,"u")){
-		aset_wlist(&as,fdmem,vtype);
+		aset_wlist(&as,fdmem,pid,vtype);
 		goto nextloop;
 	}else if(!strcmp(cmd,"select")||!strcmp(cmd,"se")){
 		aset_wipe(&as);
@@ -2350,7 +2415,7 @@ back_to_next:
 			if(sscanf(p,"%lx",&addr)==1)aset_add(&as,addr);
 			else fdprintf_atomic(STDERR_FILENO,"invaild address %s\n",p);
 		}
-		aset_wlist(&as,fdmem,vtype);
+		aset_wlist(&as,fdmem,pid,vtype);
 		goto nextloop;
 	}else if(!strncmp(ibuf,"w ",2)){
 		p=ibuf+2;
@@ -2451,12 +2516,12 @@ back_to_write:
 				}else goto nextloop;
 		}
 		if(autostop&&!freezing)kill(pid,SIGSTOP);
-		aset_write(&as,fdmem,p,len);
+		aset_write(&as,fdmem,pid,p,len);
 		if(autostop&&!freezing)kill(pid,SIGCONT);
 		if(freezing){
 			while(freezing){
 			nanosleep(&freezing_timer,NULL);
-			aset_write(&as,fdmem,p,len);
+			aset_write(&as,fdmem,pid,p,len);
 			}
 			goto back_to_freeze;
 		}
@@ -2530,16 +2595,29 @@ back_to_freeze:
 	}else if(!strcmp(cmd,"speed")||!strcmp(cmd,"sp")){
 		strtok(ibuf," \t");
 		p=strtok(NULL," \t");
+		start_time=NULL;
 		if(p){
 			if(atolodx(p,&l)==1){
 				if((p=strtok(NULL," \t"))){
 					if(atolodx(p,&u)<1||!u)goto invvalp;
+						if((p=strtok(NULL," \t"))){
+							if(dat2spec(p,&st_time)>0)start_time=&st_time;
+							else if(strptime(p,"%D",&tm0)||strptime(p,"%F",&tm0)){
+								st_time.tv_sec=mktime(&tm0);
+								if(st_time.tv_sec==(time_t)-1)goto invvalp;
+								st_time.tv_nsec=0;
+							}else if(y2stamp(p,&st_time.tv_sec)){
+								st_time.tv_nsec=0;
+							}else goto invvalp;
+
+					start_time=&st_time;
+					}
 				}else u=1;
 				u2=gcd(u,l);
 				l/=u2;
 				u/=u2;
 				freezing=1;
-				speed(fdmap,fdmem,pid,l,u);
+				speed(fdmap,fdmem,pid,l,u,start_time);
 				freezing=0;
 			}
 			else {
@@ -2824,7 +2902,7 @@ search_start:
 	if(autostop)kill(pid,SIGSTOP);
 	if(as.n){
 		aset_init(&as1);
-		r0=researchu(search_mode,&as,fdmem,p,len,&as1,cmp_matrix[vtype&1][vtype/2][cmpmode]);
+		r0=researchu(search_mode,&as,fdmem,pid,p,len,&as1,cmp_matrix[vtype&1][vtype/2][cmpmode]);
 		if(r0){
 			fdprintf_atomic(STDERR_FILENO,"Failed:%s\n",strerror(r0));
 			goto err_search;
@@ -2833,7 +2911,7 @@ search_start:
 		memcpy(&as,&as1,sizeof(struct addrset));
 
 	}else{
-		r0=searchu(search_mode,fdmap,fdmem,p,len,&as,cmp_matrix[vtype&1][vtype/2][cmpmode]);
+		r0=searchu(search_mode,fdmap,fdmem,pid,p,len,&as,cmp_matrix[vtype&1][vtype/2][cmpmode]);
 		if(r0){
 			fdprintf_atomic(STDERR_FILENO,"Failed:%s\n",strerror(r0));
 			goto err_search;
