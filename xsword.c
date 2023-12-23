@@ -9,6 +9,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <linux/futex.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,7 @@
 #include <limits.h>
 #include <dirent.h>
 #include <termios.h>
+#include <pthread.h>
 #include <elf.h>
 #define VT_I8 0
 #define VT_U8 1
@@ -41,6 +43,8 @@
 #define VBUFSIZE (sizeof(long double)>sizeof(uintmax_t)?sizeof(long double):sizeof(uintmax_t))
 #define TOCSTR(x) TOCSTR0(x)
 #define TOCSTR0(x) #x
+#define waitf(uaddr,val) syscall(SYS_futex,uaddr,FUTEX_WAIT,val,NULL,NULL,0)
+#define wakef(uaddr,val) syscall(SYS_futex,uaddr,FUTEX_WAKE,val,NULL,NULL,0)
 enum smode {SEARCH_NORMAL,SEARCH_COMPARE,SEARCH_FUZZY,SEARCH_FUZZYFIX,SEARCH_RANGE};
 float epsilon_float=FLT_EPSILON;
 double epsilon_double=DBL_EPSILON;
@@ -709,12 +713,12 @@ int uncurse(int fdmem,pid_t pid,off_t addr,const char *orig_inst){
 	return 0;
 }
 #define NS_time -1
-struct curser {
+const struct curser {
 	char *key;
 	off_t addr;
 	char orig_inst[CURSED_INSTLEN];
 	int num,state;
-} cursers[]={
+} gcursers[4]={
 	{
 		.key="_clock_gettime",
 		.addr=0,
@@ -769,6 +773,9 @@ int clock_inittime(clockid_t cid,struct timespec *ts,struct inittime *it){
 	memcpy(ts,it->cs+cid,sizeof(struct timespec));
 	return 0;
 }
+volatile sig_atomic_t ncursed=0;
+volatile sig_atomic_t nthreads=0;
+volatile uint32_t nfutex=0;
 void speed(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time){
 	struct user_regs_struct rs;
 	struct iovec iv;
@@ -782,6 +789,8 @@ void speed(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const str
 	void *back=NULL;
 	time_t time2;
 	struct inittime it={.cs=NULL,.nclocks=0};
+	struct curser cursers[sizeof(gcursers)/sizeof(struct curser)];
+	memcpy(cursers,gcursers,sizeof(gcursers));
 	ELF *ep;
 	MAP *mp;
 	iv.iov_base=&rs;
@@ -812,6 +821,19 @@ redo:
 	}
 	ptrace(PTRACE_INTERRUPT,pid,NULL,NULL);
 	r1=waitpid(pid,&status,0);
+	if(r1<0){
+		//if(errno==EINTR)
+		goto ok;
+		//else goto err;
+	}
+	//ensure all threads stopped before cursing
+	if(++ncursed<nthreads){
+		waitf(&nfutex,0);
+	}else {
+		nfutex=1;
+		wakef(&nfutex,INT_MAX);
+	}
+	//curse start
 	mp=map_fdopen(fdmap);
 	if(mp){
 		if(map_search(mp,"[vdso]")&&(vdso=malloc(mp->end-mp->start))){
@@ -833,14 +855,20 @@ redo:
 		}
 		free(mp);
 	}
-	if(r1<0&&errno!=EINTR)goto ok;
+	//curse completed
+
 	while(freezing){
 rewait_syscall:
 		ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
 		r1=waitpid(pid,&status,0);
+
 		if(cid!=-1)r2=clock_gettime(cid,&ts_old);
 		else r2=-1;
-		if(r1<0&&errno!=EINTR)goto ok;
+		if(r1<0){
+			//if(errno==EINTR)
+			goto ok;
+			//else goto err;
+		}
 		else if(WIFSTOPPED(status)){
 			if(WSTOPSIG(status)==SIGTRAP){
 				if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto err;
@@ -947,7 +975,11 @@ spec_addr_got:
 		}
 		ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
 		r1=waitpid(pid,&status,0);
-		if(r1<0&&errno!=EINTR)goto ok;
+		if(r1<0){
+			//if(errno==EINTR)
+			goto ok;
+			//else goto err;
+		}
 		switch(r0){
 			case SYS_clock_nanosleep:
 			case SYS_nanosleep:
@@ -1012,6 +1044,14 @@ ok:
 end:
 	ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
 	r1=waitpid(pid,&status,0);
+	//ensure all threads stopped before uncursing
+	if(--ncursed){
+		waitf(&nfutex,1);
+	}else {
+		nfutex=0;
+		wakef(&nfutex,INT_MAX);
+	}
+	//uncurse start
 	(r1=ptrace(PTRACE_GETREGSET,pid,1,&iv))>=0&&(cip=sip(&rs));
 	for(i=0;cursers[i].key;++i){
 		if(cursers[i].state>=0){
@@ -1032,13 +1072,102 @@ err:
 	back=&&redo;
 	goto end;
 }
-
 const char *bfname(const char *path){
 	const char *p;
 	if(path[0]=='/'&&path[1]=='\0')return path;
 	p=strrchr(path,'/');
 	return p?p+1:path;
 }
+struct speed_args {
+	int fdmap,fdmem;
+	pid_t pid;
+	uint64_t factor,frac;
+	const struct timespec *start_time;
+	pthread_t pt;
+};
+void *speedt(void *arg){
+	struct speed_args *sa=arg;
+	speed(sa->fdmap,sa->fdmem,sa->pid,sa->factor,sa->frac,sa->start_time);
+	--nthreads;
+	pthread_exit(NULL);
+	return NULL;
+}
+struct speed_args *getthreadbypid(pid_t pid){
+	DIR *d;
+	long l;
+	struct dirent *d1;
+	char buf[BUFSIZE];
+	ssize_t n,i;
+	struct speed_args *ret,*p;
+	sprintf(buf,"/proc/%ld/task",(long)pid);
+	d=opendir(buf);
+	if(d==NULL)return NULL;
+	ret=malloc(16*sizeof(struct speed_args));
+	n=16;
+	i=0;
+	if(ret==NULL){
+		closedir(d);
+		return NULL;
+	}
+	while((d1=readdir(d))){
+		if(d1->d_type!=DT_DIR||!(l=atol(d1->d_name)))continue;
+		if(i>=n){
+			p=realloc(ret,(n+=16)*sizeof(struct speed_args));
+			if(!p)goto err;
+			ret=p;
+		}
+		ret[i].pid=(pid_t)l;
+		++i;
+	}
+		if(i>=n){
+			p=realloc(ret,(n+=16)*sizeof(struct speed_args));
+			if(!p)goto err;
+			ret=p;
+		}
+		ret[i].pid=0;
+	closedir(d);
+	return ret;
+err:
+	free(ret);
+	closedir(d);
+	return NULL;
+}
+
+struct speed_args *sparg=NULL;
+
+void speedall(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time){
+	struct speed_args *sa;
+	size_t i;
+	int r;
+	sa=getthreadbypid(pid);
+	if(!sa)return;
+	i=0;
+	while(sa[i].pid){
+	++i;
+	}
+	nthreads=i;
+	ncursed=0;
+	nfutex=0;
+	i=0;
+	while(sa[i].pid){
+	sa[i].fdmap=fdmap;
+	sa[i].fdmem=fdmem;
+	sa[i].factor=factor;
+	sa[i].frac=frac;
+	sa[i].start_time=start_time;
+	pthread_create(&sa[i].pt,NULL,speedt,sa+i);
+	++i;
+	}
+	i=0;
+	sparg=sa;
+	while(sa[i].pid){
+	r=pthread_join(sa[i].pt,NULL);
+	if(r)fdprintf_atomic(STDERR_FILENO,"%s\n",strerror(r));
+	++i;
+	}
+	sparg=NULL;
+}
+
 pid_t getpidbycomm(const char *comm){
 	DIR *d;
 	long l;
@@ -1050,7 +1179,7 @@ pid_t getpidbycomm(const char *comm){
 	d=opendir("/proc");
 	if(d==NULL)return 0;
 	while((d1=readdir(d))){
-		if(d1->d_type!=DT_DIR||!(l=atol(bfname(d1->d_name))))continue;
+		if(d1->d_type!=DT_DIR||!(l=atol(d1->d_name)))continue;
 		sprintf(buf,"/proc/%s/comm",d1->d_name);
 		fd=open(buf,O_RDONLY);
 		if(fd<0)continue;
@@ -2258,6 +2387,7 @@ struct timespec freezing_timer={
 };
 volatile sig_atomic_t fdmem=-1,fdmap=-1,ioret=-1;
 void psig(int sig){
+//	size_t i;
 	switch(sig){
 		case SIGINT:
 		case SIGALRM:
@@ -2265,6 +2395,13 @@ void psig(int sig){
 				next_freezing=0;
 			}else if(freezing){
 				freezing=0;
+				/*if(sparg){
+					i=0;
+					while(sparg[i].pid){
+						pthread_kill(sparg[i].pt,SIGINT);
+						++i;
+					}
+				}*/
 			}else {
 				if(fdmem>=0)close(fdmem);
 				if(fdmap>=0)close(fdmap);
@@ -2310,6 +2447,7 @@ int main(int argc,char **argv){
 	struct tm tm0;
 	struct timespec *start_time;
 	struct range_struct rs;
+	struct sigaction act;
 	args=argv;
 	last_type[0]=0;
 	if(argc<2){
@@ -2340,8 +2478,11 @@ int main(int argc,char **argv){
 	}
 	aset_init(&as);
 	setvbuf(stdout,buf_stdout,_IOFBF,BUFSIZE_STDOUT);
-	signal(SIGINT,psig);
-	signal(SIGALRM,psig);
+	sigaction(SIGINT,NULL,&act);
+	act.sa_handler=psig;
+	act.sa_flags&=~SA_RESTART;
+	sigaction(SIGINT,&act,NULL);
+	sigaction(SIGALRM,&act,NULL);
 	for(i=2;argv[i];++i){
 		strcpy(ibuf,argv[i]);
 		back=&&here;
@@ -2736,7 +2877,7 @@ back_to_freeze:
 				l/=u2;
 				u/=u2;
 				freezing=1;
-				speed(fdmap,fdmem,pid,l,u,start_time);
+				speedall(fdmap,fdmem,pid,l,u,start_time);
 				freezing=0;
 			}
 			else {
