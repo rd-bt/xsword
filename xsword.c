@@ -648,6 +648,7 @@ ssize_t vmwriteu(int fdmem,pid_t pid,const void *buf,size_t len,uintptr_t addr){
 ssize_t vmreadu(int fdmem,pid_t pid,void *buf,size_t len,uintptr_t addr){
 	ssize_t ret;
 	struct iovec lv,rv;
+//	fdmem=-1;
 	ret=fdmem>=0?pread(fdmem,buf,len,addr):-1;
 	if(ret<0){
 		lv.iov_base=buf;
@@ -1625,6 +1626,124 @@ struct range_struct{
 	int64_t infi;
 };
 int researchu(enum smode search_mode,const struct addrset *restrict oldas,int fdmem,pid_t pid,const void *restrict val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
+	ssize_t i,n=0,ilast,s,size,r,fail;
+	char *buf,*pbuf,*fails;
+	int r0;
+	int64_t l,l1;
+	uint64_t u,u1;
+	struct iovec *lv,*rv;
+	const struct range_struct *rs;
+	rs=(const struct range_struct *restrict)val;
+	buf=malloc(len*oldas->n);
+	if(!buf)return errno;
+	pbuf=buf;
+	rv=malloc((oldas->n)*(2*sizeof(struct iovec)+1));
+	if(!rv){
+		free(pbuf);
+		return errno;
+	}
+	lv=rv+oldas->n;
+	fails=(char *)(lv+oldas->n);
+	memset(fails,0,oldas->n);
+	
+	for(i=0;i<oldas->n&&freezing;++i){
+		rv[i].iov_base=(void *)oldas->buf[i].addr;
+		lv[i].iov_base=buf+i*len;
+		lv[i].iov_len=rv[i].iov_len=len;
+	}
+	fail=i=0;
+	ilast=-oldas->n;
+	s=oldas->n/100+!!(oldas->n%100);
+	while(i<oldas->n&&freezing){
+		size=minz(oldas->n-i,IOV_MAX);
+		r=process_vm_readv(pid,lv+i,size,rv+i,size,0);
+		if(r>=(ssize_t)len){
+			i+=r/len;
+		}else {
+			fails[i]=1;
+			++i;
+			++fail;
+		}
+		if((i-ilast)>=s||i==oldas->n){
+		fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] read %zu failed %zu",i*100/oldas->n,i/len-fail,fail);
+		ilast=i;
+		}
+	}
+	write(STDERR_FILENO,"\n",1);
+	ilast=-oldas->n;
+	s=oldas->n/100+!!(oldas->n%100);
+	
+	for(i=0;i<oldas->n&&freezing;buf+=len){
+		if(!fails[i]){
+			switch(search_mode){
+				case SEARCH_COMPARE:
+					goto compare;
+				case SEARCH_FUZZY:
+					goto fuzzy;
+				case SEARCH_FUZZYFIX:
+					goto fuzzy_fix;
+				case SEARCH_RANGE:
+					goto range;
+				default:
+					break;
+			}
+		}else goto end;
+		if(!memcmp(buf,val,len))goto ok;
+		goto end;
+compare:
+		if(compar(buf,val))goto ok;
+		goto end;
+fuzzy:
+		if(compar(buf,oldas->buf[i].val))goto ok;
+		goto end;
+fuzzy_fix:
+			l=(buf[len-1]&0x80)?-1:0;
+			memcpy(&l,buf,len);
+			u=0;
+			memcpy(&u,buf,len);
+			l1=(oldas->buf[i].val[len-1]&0x80)?-1:0;
+			memcpy(&l1,oldas->buf[i].val,len);
+			u1=0;
+			memcpy(&u1,oldas->buf[i].val,len);
+			l-=l1;
+			u-=u1;
+			l1=(((const char *restrict)val)[len-1]&0x80)?-1:0;
+			memcpy(&l1,val,len);
+			u1=0;
+			memcpy(&u1,val,len);
+		if(u==u1||l==l1)goto ok;
+		goto end;
+range:
+			if(rs->supu>=rs->infu){
+				u=0;
+				memcpy(&u,buf,len);
+				if(u>=rs->infu&&u<=rs->supu)goto ok;
+			}else if(rs->supi>=rs->infi){
+				l=(buf[len-1]&0x80)?-1:0;
+				memcpy(&l,buf,len);
+				if(l>=rs->infi&&l<=rs->supi)goto ok;
+			}
+			goto end;
+ok:
+			if((r0=aset_addv(as,oldas->buf[i].addr,buf,len))<0){
+				free(rv);
+				free(pbuf);
+				return -r0;
+			}
+			++n;
+end:
+			++i;
+		if((i-ilast)>=s||i==oldas->n){
+		fdprintf_atomic(STDERR_FILENO,"\r[%3zu%%] hit %zu",i*100/oldas->n,n);
+		ilast=i;
+		}
+	}
+	write(STDERR_FILENO,"\n",1);
+	free(rv);
+	free(pbuf);
+	return 0;
+}
+int researchu_old(enum smode search_mode,const struct addrset *restrict oldas,int fdmem,pid_t pid,const void *restrict val,size_t len,struct addrset *restrict as,int (*compar)(const void *,const void *)){
 	ssize_t i=0,n=0,ilast,s;
 	char *buf=NULL;
 	int r0;
@@ -2903,12 +3022,13 @@ search_start:
 	if(as.n){
 		aset_init(&as1);
 		r0=researchu(search_mode,&as,fdmem,pid,p,len,&as1,cmp_matrix[vtype&1][vtype/2][cmpmode]);
-		if(r0){
+		if(r0&&(r0=researchu_old(search_mode,&as,fdmem,pid,p,len,&as1,cmp_matrix[vtype&1][vtype/2][cmpmode]))){
 			fdprintf_atomic(STDERR_FILENO,"Failed:%s\n",strerror(r0));
 			goto err_search;
 		}
 		aset_free(&as);
 		memcpy(&as,&as1,sizeof(struct addrset));
+		fdprintf_atomic(STDERR_FILENO,"hit %zu in summary\n",as.n);
 
 	}else{
 		r0=searchu(search_mode,fdmap,fdmem,pid,p,len,&as,cmp_matrix[vtype&1][vtype/2][cmpmode]);
