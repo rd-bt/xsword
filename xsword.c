@@ -776,6 +776,7 @@ int clock_inittime(clockid_t cid,struct timespec *ts,struct inittime *it){
 volatile sig_atomic_t ncursed=0;
 volatile sig_atomic_t nthreads=0;
 volatile uint32_t nfutex=0;
+void attachnew(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time);
 void speed(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time){
 	struct user_regs_struct rs;
 	struct iovec iv;
@@ -788,6 +789,7 @@ void speed(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const str
 	off_t *cip;
 	void *back=NULL;
 	time_t time2;
+	unsigned long event;
 	struct inittime it={.cs=NULL,.nclocks=0};
 	struct curser cursers[sizeof(gcursers)/sizeof(struct curser)];
 	memcpy(cursers,gcursers,sizeof(gcursers));
@@ -807,7 +809,7 @@ void speed(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const str
 	tv_base.tv_sec=ts_base.tv_sec;
 	tv_base.tv_usec=ts_base.tv_nsec/1000;
 redo:
-	if(ptrace(PTRACE_SEIZE,pid,NULL,PTRACE_O_TRACESYSGOOD)<0){
+	if(ptrace(PTRACE_SEIZE,pid,NULL,PTRACE_O_TRACESYSGOOD|PTRACE_O_TRACECLONE)<0){
 		fdprintf_atomic(STDERR_FILENO,"cannon speed %ld (%s)\n",(long)pid,strerror(errno));
 		clock_inittime(0,NULL,&it);
 		return;
@@ -870,7 +872,10 @@ rewait_syscall:
 			//else goto err;
 		}
 		else if(WIFSTOPPED(status)){
-			if(WSTOPSIG(status)==SIGTRAP){
+			if(status>>8 == (SIGTRAP | (PTRACE_EVENT_CLONE<<8))){
+				ptrace(PTRACE_GETEVENTMSG,pid,NULL,&event);
+				attachnew(fdmap,fdmem,event,factor,frac,start_time);
+			}else if(WSTOPSIG(status)==SIGTRAP){
 				if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto err;
 				cip=sip(&rs);
 				for(i=0;cursers[i].key;++i){
@@ -1079,19 +1084,23 @@ const char *bfname(const char *path){
 	return p?p+1:path;
 }
 struct speed_args {
-	int fdmap,fdmem;
+	int fdmap,fdmem,end;
 	pid_t pid;
 	uint64_t factor,frac;
 	const struct timespec *start_time;
 	pthread_t pt;
 };
+uint32_t allend=0;
 void *speedt(void *arg){
 	struct speed_args *sa=arg;
 	speed(sa->fdmap,sa->fdmem,sa->pid,sa->factor,sa->frac,sa->start_time);
 	--nthreads;
+	sa->end=1;
+	wakef(&allend,1);
 	pthread_exit(NULL);
 	return NULL;
 }
+size_t nsparg;
 struct speed_args *getthreadbypid(pid_t pid){
 	DIR *d;
 	long l;
@@ -1126,6 +1135,7 @@ struct speed_args *getthreadbypid(pid_t pid){
 		}
 		ret[i].pid=0;
 	closedir(d);
+	nsparg=n;
 	return ret;
 err:
 	free(ret);
@@ -1134,7 +1144,38 @@ err:
 }
 
 struct speed_args *sparg=NULL;
+pthread_mutex_t spmutex;
+void attachnew(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time){
+	size_t i=0,n;
+	struct speed_args *psa;
+	pthread_mutex_lock(&spmutex);
+	n=nsparg;
+	while(sparg[i].pid){
+		if(sparg[i].end)break;
+		++i;
+	}
+	if(!sparg[i].pid&&i>=nsparg){
+		psa=realloc(sparg,(n+=16)*sizeof(struct speed_args));
+		if(!psa)return;
+		sparg=psa;
+		memset(sparg+nsparg,0,16);
+		nsparg=n;
+	}
+	if(sparg[i].pid){
+		pthread_join(sparg[i].pt,NULL);
+	}
+	sparg[i].fdmap=fdmap;
+	sparg[i].pid=pid;
+	sparg[i].fdmem=fdmem;
+	sparg[i].factor=factor;
+	sparg[i].frac=frac;
+	sparg[i].start_time=start_time;
+	sparg[i].end=0;
+	++nthreads;
+	pthread_create(&sparg[i].pt,NULL,speedt,sparg+i);
+	pthread_mutex_unlock(&spmutex);
 
+}
 void speedall(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time){
 	struct speed_args *sa;
 	size_t i;
@@ -1149,23 +1190,33 @@ void speedall(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const 
 	ncursed=0;
 	nfutex=0;
 	i=0;
+	pthread_mutex_init(&spmutex,NULL);
+	pthread_mutex_lock(&spmutex);
 	while(sa[i].pid){
 	sa[i].fdmap=fdmap;
 	sa[i].fdmem=fdmem;
 	sa[i].factor=factor;
 	sa[i].frac=frac;
 	sa[i].start_time=start_time;
+	sa[i].end=0;
 	pthread_create(&sa[i].pt,NULL,speedt,sa+i);
 	++i;
 	}
 	i=0;
 	sparg=sa;
-	while(sa[i].pid){
-	r=pthread_join(sa[i].pt,NULL);
-	if(r)fdprintf_atomic(STDERR_FILENO,"%s\n",strerror(r));
+	pthread_mutex_unlock(&spmutex);
+	while(nthreads)
+	waitf(&allend,0);
+	do {
+	pthread_mutex_lock(&spmutex);
+	r=sparg[i].pid;
+	pthread_mutex_unlock(&spmutex);
+	pthread_join(sparg[i].pt,NULL);
 	++i;
-	}
+	}while(r);
+	free(sparg);
 	sparg=NULL;
+	pthread_mutex_destroy(&spmutex);
 }
 
 pid_t getpidbycomm(const char *comm){
