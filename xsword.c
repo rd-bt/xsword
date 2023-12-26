@@ -735,7 +735,7 @@ const struct curser {
 		.key="_time",
 		.addr=0,
 		.num=NS_time,
-		.state=1
+		.state=-1
 	},
 	{
 		.key=NULL
@@ -773,25 +773,96 @@ int clock_inittime(clockid_t cid,struct timespec *ts,struct inittime *it){
 	memcpy(ts,it->cs+cid,sizeof(struct timespec));
 	return 0;
 }
-volatile sig_atomic_t ncursed=0;
-volatile sig_atomic_t nthreads=0;
-volatile uint32_t nfutex=0;
-void attachnew(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time);
-void speed(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time){
+enum tstate {TS_UNKNOWN=-1,TS_NORMAL=0,TS_INSYSCALL};
+struct pidset {
+	pid_t pid;
+	enum tstate state;
+	long num;
+	long sarg[6];
+	struct pidset *prev;
+	struct pidset *next;
+};
+void pidset_free(struct pidset *ps){
+	struct pidset *next;
+	do {
+		next=ps->next;
+		free(ps);
+	}while((ps=next));
+}
+struct pidset *pidset_delete(struct pidset *ps,pid_t pid){
+	struct pidset *ret,*next;
+	ret=ps;
+	do {
+		next=ps->next;
+		if(ps->pid==pid){
+			if(ps->prev)ps->prev->next=ps->next;
+			else{
+				ret=ps->next;
+			}
+			if(ps->next)ps->next->prev=ps->prev;
+			free(ps);
+		}
+	}while((ps=next));
+	return ret;
+}
+struct pidset *pidset_add(struct pidset *ps,pid_t pid){
+	struct pidset *nps,*ips;
+	ips=ps;
+	nps=malloc(sizeof(struct pidset));
+	memset(nps,0,sizeof(struct pidset));
+	if(!nps)return NULL;
+	nps->next=NULL;
+	nps->pid=pid;
+	if(!ps){
+		nps->prev=NULL;
+		return nps;
+	}
+	while(ps->next){
+		ps=ps->next;
+	}
+	ps->next=nps;
+	nps->prev=ps;
+	return ips;
+}
+/*
+long pidset_getnum(struct pidset *ps,pid_t pid){
+	do {
+		if(ps->pid==pid)return ps->num;
+	}while((ps=ps->next));
+	return -1;
+}
+int pidset_setnum(struct pidset *ps,pid_t pid,long num){
+	do {
+		if(ps->pid==pid){
+			ps->num=num;
+			return 0;
+		}
+	}while((ps=ps->next));
+	return -1;
+}*/
+struct pidset *pidset_pidto(struct pidset *ps,pid_t pid){
+	do {
+		if(ps->pid==pid)return ps;
+	}while((ps=ps->next));
+	//fprintf_atomic(stderr,"notfound %d\n",pid);
+	return NULL;
+}
+void speed(int fdmap,int fdmem,struct pidset *pids,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time){
+	pid_t pid;
 	struct user_regs_struct rs;
 	struct iovec iv;
 	struct timespec ts_base,ts,ts2,ts_old,ts_new;
 	struct timeval tv_first,tv_base,tv;
 	long i,addr;
 	clockid_t cid=-1,cid2;
-	int status,r1,r0,r2,tv_inited=0,timeout,timeout2,ksig;
+	int status,r1,r0,r2,tv_inited=0,timeout,timeout2;
 	char *vdso,buf[64],*p;
 	off_t *cip;
-	void *back=NULL;
 	time_t time2;
 	unsigned long event;
 	struct inittime it={.cs=NULL,.nclocks=0};
 	struct curser cursers[sizeof(gcursers)/sizeof(struct curser)];
+	struct pidset *ps;
 	memcpy(cursers,gcursers,sizeof(gcursers));
 	ELF *ep;
 	MAP *mp;
@@ -808,12 +879,17 @@ void speed(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const str
 	//clock_inittime(CLOCK_TAI,&ts,&it);
 	tv_base.tv_sec=ts_base.tv_sec;
 	tv_base.tv_usec=ts_base.tv_nsec/1000;
-redo:
-	if(ptrace(PTRACE_SEIZE,pid,NULL,PTRACE_O_TRACESYSGOOD|PTRACE_O_TRACECLONE)<0){
+	ps=pids;
+	do {
+	pid=ps->pid;
+	if(ptrace(PTRACE_SEIZE,pid,NULL,PTRACE_O_TRACESYSGOOD|PTRACE_O_TRACEEXIT|PTRACE_O_TRACECLONE|PTRACE_O_EXITKILL)<0){
 		fdprintf_atomic(STDERR_FILENO,"cannon speed %ld (%s)\n",(long)pid,strerror(errno));
 		clock_inittime(0,NULL,&it);
-		return;
+		pids=pidset_delete(pids,pid);
+		if(!pids)goto end;
 	}else {
+		ptrace(PTRACE_INTERRUPT,pid,NULL,NULL);
+		waitpid(pid,&status,0);
 		p=ctime_r(&tv_base.tv_sec,buf);
 		if(!p){
 			sprintf(buf,"%lu\n",tv_base.tv_sec);
@@ -821,20 +897,8 @@ redo:
 		}
 		fdprintf_atomic(STDERR_FILENO,"speeding %ld at %s",pid,p);
 	}
-	ptrace(PTRACE_INTERRUPT,pid,NULL,NULL);
-	r1=waitpid(pid,&status,0);
-	if(r1<0){
-		//if(errno==EINTR)
-		goto ok;
-		//else goto err;
-	}
-	//ensure all threads stopped before cursing
-	if(++ncursed<nthreads){
-		waitf(&nfutex,0);
-	}else {
-		nfutex=1;
-		wakef(&nfutex,INT_MAX);
-	}
+	}while((ps=ps->next));
+	pid=pids->pid;
 	//curse start
 	mp=map_fdopen(fdmap);
 	if(mp){
@@ -858,30 +922,62 @@ redo:
 		free(mp);
 	}
 	//curse completed
-
+	for(ps=pids;ps;ps=ps->next){
+		ptrace(PTRACE_SYSCALL,ps->pid,NULL,NULL);
+	}
 	while(freezing){
 rewait_syscall:
-		ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
-		r1=waitpid(pid,&status,0);
-
+		pid=waitpid(-1,&status,__WALL);
+		//pid=syscall(SYS_wait4,-1,&status,__WALL,NULL);
 		if(cid!=-1)r2=clock_gettime(cid,&ts_old);
 		else r2=-1;
-		if(r1<0){
-			//if(errno==EINTR)
-			goto ok;
-			//else goto err;
-		}
-		else if(WIFSTOPPED(status)){
-			if(status>>8 == (SIGTRAP | (PTRACE_EVENT_CLONE<<8))){
+		if((int)pid<0)goto ok;
+		ps=pidset_pidto(pids,pid);
+		if(!ps)continue;
+		if(WIFSTOPPED(status)){
+			if(status>>8 == (SIGTRAP | (PTRACE_EVENT_EXIT<<8))){
+				ptrace(PTRACE_GETEVENTMSG,pid,NULL,&status);
+				ptrace(PTRACE_DETACH,pid,NULL,NULL);
+exited:
+				if(WIFEXITED(status))fdprintf_atomic(STDERR_FILENO,"%ld exited(%ld)\n",pid,(long)WEXITSTATUS(status));
+				if(WIFSIGNALED(status))fdprintf_atomic(STDERR_FILENO,"%ld was killed (by signal %ld)\n",pid,(long)WTERMSIG(status));
+				pids=pidset_delete(pids,pid);
+				if(!pids)goto end;
+				//fdprintf_atomic(stderr,"%lu\n",event);
+			}else if(status>>8 == (SIGTRAP | (PTRACE_EVENT_CLONE<<8))){
 				ptrace(PTRACE_GETEVENTMSG,pid,NULL,&event);
-				attachnew(fdmap,fdmem,event,factor,frac,start_time);
+				pidset_add(pids,event);
+				//ptrace(PTRACE_SETOPTIONS,event,NULL,PTRACE_O_TRACESYSGOOD|PTRACE_O_TRACEEXIT|PTRACE_O_TRACECLONE|PTRACE_O_EXITKILL);
+				ptrace(PTRACE_SYSCALL,event,NULL,NULL);
+				ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
+				fdprintf_atomic(STDERR_FILENO,"speeding %ld (started by %ld) at %s",(long)event,(long)pid,p);
+				//fdprintf_atomic(stderr,"%lu\n",event);
+			}else if(WSTOPSIG(status)==(SIGTRAP|0x80)){
+			if(ps->state==TS_NORMAL){
+				ps->state=TS_INSYSCALL;
+				//fprintf_atomic(stderr,"%ld\n",ps->num);
+				if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto err;
+				ps->sarg[0]=*sarg1(&rs);
+				ps->sarg[1]=*sarg2(&rs);
+				ps->sarg[2]=*sarg3(&rs);
+				ps->sarg[3]=*sarg4(&rs);
+				ps->sarg[4]=*sarg5(&rs);
+				ps->sarg[5]=*sarg6(&rs);
+				ps->num=r0=*snum(&rs);
+				goto sys_start;
+			}else if(ps->state==TS_INSYSCALL){
+				ps->state=TS_NORMAL;
+				if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto err;
+				r0=ps->num;
+				goto sys_end;
+			}
 			}else if(WSTOPSIG(status)==SIGTRAP){
 				if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto err;
 				cip=sip(&rs);
 				for(i=0;cursers[i].key;++i){
 					if(cursers[i].state>=0&&*cip+BREAK_IPCUR==cursers[i].addr){
-						switch(cursers[i].num){
-							case NS_time:
+				switch(cursers[i].num){
+					case NS_time:
 				addr=*carg1(&rs);
 				if(tv_inited){
 				 	gettimeofday(&tv,NULL);
@@ -897,17 +993,28 @@ rewait_syscall:
 				}
 				*cret(&rs)=time2;
 				if(addr)vmwriteu(fdmem,pid,&time2,sizeof time2,addr);
-				break;
-							default:
-								*snum(&rs)=cursers[i].num;
+				goto break_end;
+					default:
+						*snum(&rs)=cursers[i].num;
+						goto break_end;
 						}
 					}
 				}
+				goto common_signal;
+break_end:
 				*cip+=BREAK_IPADD;
 				if(ptrace(PTRACE_SETREGSET,pid,1,&iv)<0)goto err;
+				ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
+				goto rewait_syscall;
+			}else{
+common_signal:
+				ptrace(PTRACE_SYSCALL,pid,NULL,WSTOPSIG(status));
 				goto rewait_syscall;
 			}
-			else if(WSTOPSIG(status)==SIGCHLD){
+		}else if(WIFEXITED(status)||WIFSIGNALED(status)){
+			goto exited;
+		}
+			/*else if(WSTOPSIG(status)==SIGCHLD){
 				goto rewait_syscall;
 			}
 			else if(!(WSTOPSIG(status)&0x80)){
@@ -915,12 +1022,12 @@ rewait_syscall:
 			back=&&killed;
 			goto end;
 killed:
-			kill(pid,ksig);
+			syscall(SYS_tkill,pid,ksig);
 			goto redo;
-			}
-		}
-		if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto err;
-		r0=*snum(&rs);
+			}*/
+			continue;
+sys_start:
+
 		//r0=0;//
 		switch(r0){
 			case SYS_clock_gettime:
@@ -979,17 +1086,21 @@ spec_addr_got:
 				break;
 		}
 		ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
-		r1=waitpid(pid,&status,0);
-		if(r1<0){
-			//if(errno==EINTR)
-			goto ok;
-			//else goto err;
-		}
+		continue;
+sys_end:
 		switch(r0){
-			case SYS_clock_nanosleep:
 			case SYS_nanosleep:
+				addr=ps->sarg[0];
+				goto spec_addr_got2;
+			case SYS_clock_nanosleep:
+				addr=ps->sarg[2];
+				goto spec_addr_got2;
 			case SYS_pselect6:
+				addr=ps->sarg[4];
+				goto spec_addr_got2;
 			case SYS_ppoll:
+				addr=ps->sarg[2];
+spec_addr_got2:
 				if(addr){
 					vmwriteu(fdmem,pid,&ts2,sizeof ts,addr);
 					if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto err;
@@ -997,10 +1108,11 @@ spec_addr_got:
 				}
 				break;
 			case SYS_epoll_pwait:
+				addr=ps->sarg[3];
 				if(addr)vmwriteu(fdmem,pid,&timeout2,sizeof timeout,addr);
 				break;
 			case SYS_gettimeofday:
-				addr=*sarg1(&rs);
+				addr=ps->sarg[0];
 				if(addr){
 					if(tv_inited){
 					if(vmreadu(fdmem,pid,&tv,sizeof tv,addr)<0)break;
@@ -1043,39 +1155,42 @@ spec_addr_got:
 			default:
 				break;
 		}
+		ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
 	}
 ok:
-	back=NULL;
-end:
-	ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
-	r1=waitpid(pid,&status,0);
-	//ensure all threads stopped before uncursing
-	if(--ncursed){
-		waitf(&nfutex,1);
-	}else {
-		nfutex=0;
-		wakef(&nfutex,INT_MAX);
+	for(ps=pids;ps;ps=ps->next){
+		if(ps->state==TS_INSYSCALL)ptrace(PTRACE_SYSCALL,ps->pid,NULL,NULL);
+		ptrace(PTRACE_INTERRUPT,ps->pid,NULL,NULL);
+		r1=waitpid(ps->pid,&status,0);
 	}
-	//uncurse start
-	(r1=ptrace(PTRACE_GETREGSET,pid,1,&iv))>=0&&(cip=sip(&rs));
 	for(i=0;cursers[i].key;++i){
 		if(cursers[i].state>=0){
-			uncurse(fdmem,pid,cursers[i].addr,cursers[i].orig_inst);
-			if(r1>=0){
-				if(*cip+BREAK_IPCUR==cursers[i].addr){
-					*cip+=BREAK_IPCUR;
-					ptrace(PTRACE_SETREGSET,pid,1,&iv);
+			uncurse(fdmem,pids->pid,cursers[i].addr,cursers[i].orig_inst);
+			for(ps=pids;ps;ps=ps->next){
+				(r1=ptrace(PTRACE_GETREGSET,ps->pid,1,&iv))>=0&&(cip=sip(&rs));
+				if(r1>=0){
+					if(*cip+BREAK_IPCUR==cursers[i].addr){
+						*cip+=BREAK_IPCUR;
+						ptrace(PTRACE_SETREGSET,ps->pid,1,&iv);
+					}
 				}
 			}
 		}
 	}
-	ptrace(PTRACE_DETACH,pid,NULL,NULL);
-	if(back)goto *back;
+	for(ps=pids;ps;ps=ps->next){
+		ptrace(PTRACE_DETACH,ps->pid,NULL,NULL);
+		fdprintf_atomic(STDERR_FILENO,"ended speeding %ld\n",(long)ps->pid);
+	}
+	//if(back)goto *back;
+end:
+	if(pids)pidset_free(pids);
 	clock_inittime(0,NULL,&it);
 	return;
 err:
-	back=&&redo;
-	goto end;
+	pids=pidset_delete(pids,pid);
+	if(!pids)goto end;
+	//back=&&redo;
+	goto rewait_syscall;
 }
 const char *bfname(const char *path){
 	const char *p;
@@ -1083,140 +1198,36 @@ const char *bfname(const char *path){
 	p=strrchr(path,'/');
 	return p?p+1:path;
 }
-struct speed_args {
-	int fdmap,fdmem,end;
-	pid_t pid;
-	uint64_t factor,frac;
-	const struct timespec *start_time;
-	pthread_t pt;
-};
-uint32_t allend=0;
-void *speedt(void *arg){
-	struct speed_args *sa=arg;
-	speed(sa->fdmap,sa->fdmem,sa->pid,sa->factor,sa->frac,sa->start_time);
-	--nthreads;
-	sa->end=1;
-	wakef(&allend,1);
-	pthread_exit(NULL);
-	return NULL;
-}
-size_t nsparg;
-struct speed_args *getthreadbypid(pid_t pid){
+
+struct pidset *getthreadbypid(pid_t pid){
 	DIR *d;
 	long l;
 	struct dirent *d1;
 	char buf[BUFSIZE];
-	ssize_t n,i;
-	struct speed_args *ret,*p;
+	struct pidset *ret,*p;
 	sprintf(buf,"/proc/%ld/task",(long)pid);
 	d=opendir(buf);
 	if(d==NULL)return NULL;
-	ret=malloc(16*sizeof(struct speed_args));
-	n=16;
-	i=0;
-	if(ret==NULL){
-		closedir(d);
-		return NULL;
-	}
+	ret=pidset_add(NULL,pid);
+	if(!ret)goto end;
 	while((d1=readdir(d))){
-		if(d1->d_type!=DT_DIR||!(l=atol(d1->d_name)))continue;
-		if(i>=n){
-			p=realloc(ret,(n+=16)*sizeof(struct speed_args));
-			if(!p)goto err;
-			ret=p;
-		}
-		ret[i].pid=(pid_t)l;
-		++i;
+		if(d1->d_type!=DT_DIR||!(l=atol(d1->d_name))||pid==(pid_t)l)continue;
+		p=pidset_add(ret,(pid_t)l);
+		if(p)ret=p;
 	}
-		if(i>=n){
-			p=realloc(ret,(n+=16)*sizeof(struct speed_args));
-			if(!p)goto err;
-			ret=p;
-		}
-		ret[i].pid=0;
+end:
 	closedir(d);
-	nsparg=n;
 	return ret;
-err:
-	free(ret);
-	closedir(d);
-	return NULL;
+//err:
+//	free(ret);
+//	closedir(d);
+//	return NULL;
 }
 
-struct speed_args *sparg=NULL;
-pthread_mutex_t spmutex;
-void attachnew(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time){
-	size_t i=0,n;
-	struct speed_args *psa;
-	pthread_mutex_lock(&spmutex);
-	n=nsparg;
-	while(sparg[i].pid){
-		if(sparg[i].end)break;
-		++i;
-	}
-	if(!sparg[i].pid&&i>=nsparg){
-		psa=realloc(sparg,(n+=16)*sizeof(struct speed_args));
-		if(!psa)return;
-		sparg=psa;
-		memset(sparg+nsparg,0,16);
-		nsparg=n;
-	}
-	if(sparg[i].pid){
-		pthread_join(sparg[i].pt,NULL);
-	}
-	sparg[i].fdmap=fdmap;
-	sparg[i].pid=pid;
-	sparg[i].fdmem=fdmem;
-	sparg[i].factor=factor;
-	sparg[i].frac=frac;
-	sparg[i].start_time=start_time;
-	sparg[i].end=0;
-	++nthreads;
-	pthread_create(&sparg[i].pt,NULL,speedt,sparg+i);
-	pthread_mutex_unlock(&spmutex);
-
-}
 void speedall(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time){
-	struct speed_args *sa;
-	size_t i;
-	int r;
-	sa=getthreadbypid(pid);
-	if(!sa)return;
-	i=0;
-	while(sa[i].pid){
-	++i;
-	}
-	nthreads=i;
-	ncursed=0;
-	nfutex=0;
-	i=0;
-	pthread_mutex_init(&spmutex,NULL);
-	pthread_mutex_lock(&spmutex);
-	while(sa[i].pid){
-	sa[i].fdmap=fdmap;
-	sa[i].fdmem=fdmem;
-	sa[i].factor=factor;
-	sa[i].frac=frac;
-	sa[i].start_time=start_time;
-	sa[i].end=0;
-	pthread_create(&sa[i].pt,NULL,speedt,sa+i);
-	++i;
-	}
-	i=0;
-	sparg=sa;
-	pthread_mutex_unlock(&spmutex);
-	while(nthreads)
-	waitf(&allend,0);
-	do {
-	pthread_mutex_lock(&spmutex);
-	r=sparg[i].pid;
-	pthread_mutex_unlock(&spmutex);
-	pthread_join(sparg[i].pt,NULL);
-	++i;
-	}while(r);
-	free(sparg);
-	sparg=NULL;
-	pthread_mutex_destroy(&spmutex);
+	struct pidset *ps;
+	ps=getthreadbypid(pid);
+	if(ps)speed(fdmap,fdmem,ps,factor,frac,start_time);
 }
 
 pid_t getpidbycomm(const char *comm){
