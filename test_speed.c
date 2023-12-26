@@ -8,7 +8,7 @@ int main(void){
 	time_t t,tr,i=0;
 	struct timespec ts,ts1;
 	char *p,*p2;
-	printf("my pid %lu \n",(long)getpid());
+	//printf("my pid %lu \n",(long)getpid());
 	setvbuf(stdout,buf,_IOFBF,9999);
 	while(1){
 	gettimeofday(&tv,NULL);
