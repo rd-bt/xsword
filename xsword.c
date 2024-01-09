@@ -14,7 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <complex.h>
 #include <stdarg.h>
 #include <limits.h>
 #include <dirent.h>
@@ -497,8 +496,9 @@ void tsmul(struct timespec *restrict d,uint64_t factor){
 	d->tv_sec+=d->tv_nsec/NSEC_PER_SEC;
 	d->tv_nsec%=NSEC_PER_SEC;
 }
-void tsdiv(struct timespec *restrict d,uint64_t frac){
+void tsdiv(struct timespec *restrict d,int64_t frac){
 	if(d->tv_nsec>=NSEC_PER_SEC||d->tv_nsec>=NSEC_PER_SEC||frac==1)return;
+	if(frac<0)frac=-frac;
 	d->tv_nsec+=d->tv_sec*NSEC_PER_SEC;
 	d->tv_nsec/=frac;
 	d->tv_sec=d->tv_nsec/NSEC_PER_SEC;
@@ -546,6 +546,7 @@ void tvmul(struct timeval *restrict d,uint64_t factor){
 }
 void tvdiv(struct timeval *restrict d,uint64_t frac){
 	if(d->tv_usec>=USEC_PER_SEC||d->tv_usec>=USEC_PER_SEC||frac==1)return;
+	if(frac<0)frac=-frac;
 	d->tv_usec+=d->tv_sec*USEC_PER_SEC;
 	d->tv_usec/=frac;
 	d->tv_sec=d->tv_usec/USEC_PER_SEC;
@@ -868,17 +869,7 @@ void speed(int fdmap,int fdmem,struct pidset *pids,uint64_t factor,uint64_t frac
 	MAP *mp;
 	iv.iov_base=&rs;
 	iv.iov_len=sizeof rs;
-	if(start_time){
-		memcpy(&ts_base,start_time,sizeof ts);
-	}else {
-		clock_gettime(CLOCK_REALTIME,&ts_base);
-	}
-	//clock_inittime(CLOCK_REALTIME,&ts,&it);
-	//clock_inittime(CLOCK_REALTIME_ALARM,&ts,&it);
-	//clock_inittime(CLOCK_REALTIME_COARSE,&ts,&it);
-	//clock_inittime(CLOCK_TAI,&ts,&it);
-	tv_base.tv_sec=ts_base.tv_sec;
-	tv_base.tv_usec=ts_base.tv_nsec/1000;
+
 	ps=pids;
 	do {
 	pid=ps->pid;
@@ -890,12 +881,8 @@ void speed(int fdmap,int fdmem,struct pidset *pids,uint64_t factor,uint64_t frac
 	}else {
 		ptrace(PTRACE_INTERRUPT,pid,NULL,NULL);
 		waitpid(pid,&status,0);
-		p=ctime_r(&tv_base.tv_sec,buf);
-		if(!p){
-			sprintf(buf,"%lu\n",tv_base.tv_sec);
-			p=buf;
-		}
-		fdprintf_atomic(STDERR_FILENO,"speeding %ld at %s",pid,p);
+
+		fdprintf_atomic(STDERR_FILENO,"speeding %ld\n",pid);
 	}
 	}while((ps=ps->next));
 	pid=pids->pid;
@@ -925,6 +912,23 @@ void speed(int fdmap,int fdmem,struct pidset *pids,uint64_t factor,uint64_t frac
 	for(ps=pids;ps;ps=ps->next){
 		ptrace(PTRACE_SYSCALL,ps->pid,NULL,NULL);
 	}
+	if(start_time){
+		memcpy(&ts_base,start_time,sizeof ts);
+	}else {
+		clock_gettime(CLOCK_REALTIME,&ts_base);
+	}
+	//clock_inittime(CLOCK_REALTIME,&ts,&it);
+	//clock_inittime(CLOCK_REALTIME_ALARM,&ts,&it);
+	//clock_inittime(CLOCK_REALTIME_COARSE,&ts,&it);
+	//clock_inittime(CLOCK_TAI,&ts,&it);
+	tv_base.tv_sec=ts_base.tv_sec;
+	tv_base.tv_usec=ts_base.tv_nsec/1000;
+		p=ctime_r(&tv_base.tv_sec,buf);
+		if(!p){
+			sprintf(buf,"%lu\n",tv_base.tv_sec);
+			p=buf;
+		}
+	fdprintf_atomic(STDERR_FILENO,"at %s",p);
 	while(freezing){
 rewait_syscall:
 		pid=waitpid(-1,&status,__WALL);
@@ -950,7 +954,7 @@ exited:
 				//ptrace(PTRACE_SETOPTIONS,event,NULL,PTRACE_O_TRACESYSGOOD|PTRACE_O_TRACEEXIT|PTRACE_O_TRACECLONE|PTRACE_O_EXITKILL);
 				ptrace(PTRACE_SYSCALL,event,NULL,NULL);
 				ptrace(PTRACE_SYSCALL,pid,NULL,NULL);
-				fdprintf_atomic(STDERR_FILENO,"speeding %ld (started by %ld) at %s",(long)event,(long)pid,p);
+				fdprintf_atomic(STDERR_FILENO,"speeding %ld (started by %ld)\n",(long)event,(long)pid);
 				//fdprintf_atomic(stderr,"%lu\n",event);
 			}else if(WSTOPSIG(status)==(SIGTRAP|0x80)){
 			if(ps->state==TS_NORMAL){
@@ -2501,7 +2505,7 @@ int main(int argc,char **argv){
 	struct addrset as,as1;
 	struct timespec sleepts;
 	size_t len,slen=0,nnext,n2;
-	long l,i;
+	int64_t l,i;
 	uint64_t u,u2;
 	off_t addr;
 	struct termios argp;
@@ -2545,13 +2549,6 @@ int main(int argc,char **argv){
 	act.sa_flags&=~SA_RESTART;
 	sigaction(SIGINT,&act,NULL);
 	sigaction(SIGALRM,&act,NULL);
-	for(i=2;argv[i];++i){
-		strcpy(ibuf,argv[i]);
-		back=&&here;
-		goto gotcmd;
-here:
-		back=NULL;
-	}
 	ioret=ioctl(STDIN_FILENO,TCGETS,&argp_backup);
 	if(ioret>=0){
 	memcpy(&argp,&argp_backup,sizeof(struct termios));
@@ -2560,6 +2557,14 @@ here:
 	argp.c_cc[VTIME]=0;
 	ioctl(STDIN_FILENO,TCSETS,&argp);
 	}
+	for(i=2;argv[i];++i){
+		strcpy(ibuf,argv[i]);
+		back=&&here;
+		goto gotcmd;
+here:
+		back=NULL;
+	}
+
 	for(;;){
 	fdprintf_atomic(STDERR_FILENO,"%s>",last_type[0]?last_type:argv[0]);
 	if(read_input(STDIN_FILENO,ibuf,BUFSIZE)<=0)break;
