@@ -5,11 +5,18 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <float.h>
+#include <termios.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <sys/user.h>
 #include <linux/futex.h>
+#include <sys/time.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -848,7 +855,7 @@ struct pidset *pidset_pidto(struct pidset *ps,pid_t pid){
 	//fprintf_atomic(stderr,"notfound %d\n",pid);
 	return NULL;
 }
-void speed(int fdmap,int fdmem,struct pidset *pids,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time){
+void speed(int fdmap,int fdmem,struct pidset *pids,uint64_t factor,uint64_t frac,const struct timespec *start_time){
 	pid_t pid;
 	struct user_regs_struct rs;
 	struct iovec iv;
@@ -1171,7 +1178,7 @@ ok:
 		if(cursers[i].state>=0){
 			uncurse(fdmem,pids->pid,cursers[i].addr,cursers[i].orig_inst);
 			for(ps=pids;ps;ps=ps->next){
-				(r1=ptrace(PTRACE_GETREGSET,ps->pid,1,&iv))>=0&&(cip=sip(&rs));
+				if((r1=ptrace(PTRACE_GETREGSET,ps->pid,1,&iv))>=0)(cip=sip(&rs));
 				if(r1>=0){
 					if(*cip+BREAK_IPCUR==cursers[i].addr){
 						*cip+=BREAK_IPCUR;
@@ -1228,7 +1235,7 @@ end:
 //	return NULL;
 }
 
-void speedall(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *_Nullable start_time){
+void speedall(int fdmap,int fdmem,pid_t pid,uint64_t factor,uint64_t frac,const struct timespec *start_time){
 	struct pidset *ps;
 	ps=getthreadbypid(pid);
 	if(ps)speed(fdmap,fdmem,ps,factor,frac,start_time);
@@ -1291,7 +1298,7 @@ void aset_init(struct addrset *restrict aset){
 	aset->valued=0;
 }
 
-int aset_addv(struct addrset *restrict aset,off_t addr,const void *_Nullable val,size_t len){
+int aset_addv(struct addrset *restrict aset,off_t addr,const void *val,size_t len){
 	void *nbuf;
 	while(aset->n>=aset->size){
 		nbuf=realloc(aset->buf,(aset->size+SIZE_ASET)*sizeof(struct addrval));
@@ -1335,6 +1342,7 @@ void aset_list(struct addrset *restrict aset,int fdmem,pid_t pid,int vtype,size_
 	uint64_t u;
 	int toa=0,array=0;
 	short r;
+	ilen=len;
 	if(vtype&VT_ARRAY){
 		array=1;
 		vtype&=~VT_ARRAY;
@@ -1342,6 +1350,7 @@ void aset_list(struct addrset *restrict aset,int fdmem,pid_t pid,int vtype,size_
 		switch(vtype){
 			case VT_STR:
 			case VT_ASCII:
+				ulen=1;
 				break;
 			case VT_I8:
 			case VT_U8:
@@ -1375,9 +1384,10 @@ fnum:
 				toa=2;
 				break;
 			default:
-				break;
+				fdprintf_atomic(STDERR_FILENO,"invaild type\n");
+				return;
 		}
-	if(array)ilen=len/ulen;
+	if(array)ilen/=ulen;
 	buf=malloc(len);
 	if(!buf){
 		fdprintf_atomic(STDERR_FILENO,"failed (%s)\n",strerror(errno));
@@ -1787,8 +1797,7 @@ int getfuzzymode(const char *p1,int *restrict cmpmode){
 	else return 0;
 	++p1;
 	}
-	cm+=eq;
-	if(ok)*cmpmode=cm;
+	if(ok)*cmpmode=cm+eq;
 	return ok;
 }
 int findkeyword(const char *vn){
@@ -2504,7 +2513,7 @@ int main(int argc,char **argv){
 	char vbuf2[VBUFSIZE];
 	struct addrset as,as1;
 	struct timespec sleepts;
-	size_t len,slen=0,nnext,n2;
+	size_t len,slen=0,nnext=0,n2=0;
 	int64_t l,i;
 	uint64_t u,u2;
 	off_t addr;
@@ -2530,13 +2539,13 @@ int main(int argc,char **argv){
 	}
 	memset(cmd_last,0,CMD_RECORD_MAX*BUFSIZE);
 	sprintf(pid_str,"%ld",(long)pid);
-	sprintf(buf,"/proc/%s/maps",pid_str);
+	sprintf(buf,"/proc/%ld/maps",(long)pid);
 	fdmap=open(buf,O_RDONLY);
 	if(fdmap<0){
 		fdprintf_atomic(STDERR_FILENO,"%s:%s\n",buf,strerror(errno));
 		goto err0;
 	}
-	sprintf(buf,"/proc/%s/mem",pid_str);
+	sprintf(buf,"/proc/%ld/mem",(long)pid);
 	fdmem=open(buf,O_RDWR);
 	if(fdmem<0){
 		fdprintf_atomic(STDERR_FILENO,"%s:%s\n",buf,strerror(errno));
@@ -2575,7 +2584,6 @@ gotcmd:
 	sscanf(ibuf,"%s",cmd);
 	if(!strcmp(cmd,"next")||!strcmp(cmd,"n")){
 		n2=0;
-		nnext=1;
 		strtok(ibuf," \t");
 		p=strtok(NULL," \t");
 		if(p){
@@ -2588,7 +2596,7 @@ gotcmd:
 				fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p);
 				goto nextloop;
 			}
-		}
+		}else nnext=1;
 		if(cmd_last[index_last][0]){
 		next_freezing=1;
 next_again:
@@ -3020,7 +3028,7 @@ invvalp:
 		vtype=VT_ARRAY;
 		strtok(ibuf," \t");
 		if(!(p1=strtok(NULL," \t")))goto invcmd;
-		sprintf(last_type,"%s %s",cmd,p1);
+		sprintf(last_type,"%s %s","array",p1);
 arr:
 		if(!strcmp(p1,"i8")){vtype|=VT_I8;len=sizeof(int8_t);}
 		else if(!strcmp(p1,"u8")){vtype|=VT_U8;len=sizeof(int8_t);}
@@ -3063,7 +3071,8 @@ arr:
 					r0=scanldbl(p1,p);
 					break;
 				default:
-					break;
+					fdprintf_atomic(STDERR_FILENO,"invaild type\n");
+					goto nextloop;
 			}
 			if(r0<1){
 			fdprintf_atomic(STDERR_FILENO,"invaild value %s\n",p1);
