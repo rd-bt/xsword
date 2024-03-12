@@ -862,7 +862,8 @@ void speed(int fdmap,int fdmem,struct pidset *pids,uint64_t factor,uint64_t frac
 	struct timespec ts_base,ts,ts2,ts_old,ts_new;
 	struct timeval tv_first,tv_base,tv;
 	long i,addr;
-	clockid_t cid=-1,cid2;
+	const clockid_t cid=CLOCK_REALTIME;
+	clockid_t cid2;
 	int status,r1,r0,r2,tv_inited=0,timeout,timeout2;
 	char *vdso,buf[64],*p;
 	off_t *cip;
@@ -940,8 +941,9 @@ void speed(int fdmap,int fdmem,struct pidset *pids,uint64_t factor,uint64_t frac
 rewait_syscall:
 		pid=waitpid(-1,&status,__WALL);
 		//pid=syscall(SYS_wait4,-1,&status,__WALL,NULL);
-		if(cid!=-1)r2=clock_gettime(cid,&ts_old);
-		else r2=-1;
+		r2=(cid!=-1)?
+			clock_gettime(0,&ts_old):
+			-1;
 		if((int)pid<0)goto ok;
 		ps=pidset_pidto(pids,pid);
 		if(!ps)continue;
@@ -1069,7 +1071,7 @@ spec_addr_got:
 					ts.tv_sec=0;
 					ts.tv_nsec=0;
 				}
-				if(r2>=0&&!clock_gettime(cid,&ts_new)){
+				if(cid!=-1&&r2>=0&&!clock_gettime(cid,&ts_new)){
 					tssub(&ts_new,&ts_old);
 					tssub(&ts,&ts_new);
 				}
@@ -1115,7 +1117,7 @@ spec_addr_got2:
 				if(addr){
 					vmwriteu(fdmem,pid,&ts2,sizeof ts,addr);
 					if(ptrace(PTRACE_GETREGSET,pid,1,&iv)<0)goto err;
-					if(*sret(&rs)>=0)cid=cid2;
+					//if(*sret(&rs)>=0)cid=cid2;
 				}
 				break;
 			case SYS_epoll_pwait:
